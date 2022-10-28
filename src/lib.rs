@@ -1,13 +1,16 @@
 pub mod ivyerror;
 mod peer;
+mod ivy_messages;
 
-use std::{net::{TcpListener, SocketAddr, TcpStream}, fmt::write, str::FromStr, io::Read, thread};
+use std::{net::{TcpListener, SocketAddr, TcpStream}, fmt::write, str::FromStr, io::Read, thread::{self, JoinHandle}, sync::{Arc, Mutex}};
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use ivyerror::IvyError;
 use peer::Peer;
 use std::time::Duration;
 
 const PROTOCOL_VERSION: u32 = 3;
+
+
 
 pub struct IvyBus {
     pub appname: String,
@@ -16,9 +19,13 @@ pub struct IvyBus {
 
 struct BusPrivate {
     domain: String,
-    udp_socket: Socket,
-    tcp_listener: TcpListener,
-    watcher_id: String
+    //subscriptions: Vec<(String, Fn)>,
+    udp_handle: JoinHandle<()>,
+    tcp_handle: JoinHandle<()>,
+    ////tcp_listener: TcpListener,
+    //listener: std::thread::JoinHandle<_>,
+    watcher_id: String,
+    peers: Arc<Mutex<Vec<Peer>>>,
 }
 
 impl IvyBus {
@@ -59,24 +66,48 @@ impl IvyBus {
         let announce = format!("{} {} {} {}\n", PROTOCOL_VERSION, port, watcher_id, self.appname);
         udp_socket.send_to(announce.as_bytes(), &address)?;
 
-        self.bus = BusPrivate{domain: domain.to_string(), udp_socket, tcp_listener, watcher_id}.into();
+        let udp_handle = std::thread::spawn(move || {
+            // udp_socket blocking listen
+            // with mpsc channel to stop it
+        });
 
-        for stream in self.bus.as_ref().unwrap().tcp_listener.incoming() {
-            
+        let peers = Arc::new(Mutex::new(Vec::new()));
+
+        let tcpeers = peers.clone();
+
+        let tcp_handle = std::thread::spawn(move || {
+            // TODO mpsc channel to stop it
+            for stream in tcp_listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        Peer::handle_incoming(stream);
+                        let p = Peer::handle_incoming(stream);
+                        tcpeers.lock().unwrap().push(p);
                     }
                     Err(e) => { println!("fail: {:?}", e);}
                 }
         
-        }
+            }
+        });
 
-
-
-
+        self.bus = BusPrivate{domain: domain.to_string(), udp_handle, tcp_handle, watcher_id, peers}.into();
         
         Ok(())
+    }
+
+    pub fn join(self) {
+        match self.bus {
+            Some(bus) => {
+                let _ = bus.tcp_handle.join();
+                let _ = bus.udp_handle.join();
+            },
+            None => (),
+        }
+    }
+
+    pub fn send_msg(&self, msg: &str) {
+        for peer in self.bus.as_ref().unwrap().peers.lock().unwrap().iter() {
+            peer.send_message(msg);
+        }
     }
 
 }

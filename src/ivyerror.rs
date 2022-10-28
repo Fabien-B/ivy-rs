@@ -4,6 +4,7 @@ use std::io;
 pub enum IvyError {
     BadDomain,
     IoError(io::Error),
+    ParseFail,
 }
 
 
