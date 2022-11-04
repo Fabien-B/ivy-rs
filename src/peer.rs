@@ -1,5 +1,5 @@
 
-use std::{net::TcpStream, io::{Error, Read, Write}};
+use std::{net::TcpStream, io::{Error, Read, Write}, sync::{Arc, Mutex}};
 use std::sync::mpsc;
 use std::time::Duration;
 use crate::ivy_messages::IvyMsg;
@@ -18,7 +18,7 @@ pub struct Peer {
     joinHandle: std::thread::JoinHandle<()>,
     ch_cmd: mpsc::Sender<Command>,
     ch_msg: mpsc::Receiver<Command>,
-    //subscriptions: Vec<String>
+    subscriptions: Arc<Mutex<Vec<(u32, String)>>>
     //stream: TcpStream,
 }
 
@@ -34,6 +34,9 @@ impl Peer {
         let mut stream = stream;
         println!("ok: {:?}", stream);
         stream.set_read_timeout(Duration::from_millis(500).into()).unwrap();
+        let subscriptions = Arc::new(Mutex::new(Vec::new()));
+
+        let subs = subscriptions.clone();
         
         
         let th = std::thread::spawn(move || {
@@ -43,10 +46,24 @@ impl Peer {
                     buf[0..n].split(|c| *c == '\n' as u8)
                     .filter(|b| b.len() != 0)
                     .for_each(|b| {
-                        let a = std::str::from_utf8(&b).unwrap();
-                        println!("{:?}", a);
-                        let ivy_msg = IvyMsg::parse(b);
-                        
+                        if let Ok(ivy_msg) = IvyMsg::parse(b) {
+                            println!("{:?}", ivy_msg);
+                            match ivy_msg {
+                                IvyMsg::Bye => todo!(),
+                                IvyMsg::Sub(sub_id, reg) => subs.lock().unwrap().push((sub_id, reg)),
+                                IvyMsg::TextMsg(_, _) => todo!(),
+                                IvyMsg::Error(_) => todo!(),
+                                IvyMsg::DelSub(sub_id) => {
+                                    subs.lock().unwrap().retain(|(id, _)| *id == sub_id);
+                                },
+                                IvyMsg::EndSub => todo!(),
+                                IvyMsg::PeerId(port, app_name) => (),
+                                IvyMsg::DirectMsg(_, _) => todo!(),
+                                IvyMsg::Quit => todo!(),
+                                IvyMsg::Ping(ping_id) => Peer::send(&mut stream, IvyMsg::Pong(ping_id)),
+                                IvyMsg::Pong(ping_id) => todo!(),
+                            }
+                        }
                     });
 
                 }
@@ -60,7 +77,8 @@ impl Peer {
         Self {
             joinHandle: th,
             ch_cmd: tx_cmd,
-            ch_msg: rx_msg
+            ch_msg: rx_msg,
+            subscriptions
         }
     }
 

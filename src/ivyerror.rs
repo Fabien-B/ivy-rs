@@ -1,9 +1,10 @@
-use std::io;
+use std::{io, num::ParseIntError};
 
 #[derive(Debug)]
 pub enum IvyError {
     BadDomain,
     IoError(io::Error),
+    ParseError(ParseIntError),
     ParseFail,
 }
 
@@ -11,5 +12,12 @@ pub enum IvyError {
 impl From<io::Error> for IvyError {
     fn from(e: io::Error) -> Self {
         IvyError::IoError(e)
+    }
+}
+
+
+impl From<ParseIntError> for IvyError {
+    fn from(e: ParseIntError) -> Self {
+        IvyError::ParseError(e)
     }
 }

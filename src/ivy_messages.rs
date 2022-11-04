@@ -5,7 +5,7 @@ use crate::ivyerror::IvyError;
 pub enum IvyMsg {
     Bye,
     Sub(u32, String),
-    TextMsg(u32, String),
+    TextMsg(u32, Vec<String>),
     Error(String),
     DelSub(u32),
     EndSub,
@@ -19,46 +19,74 @@ pub enum IvyMsg {
 
 impl IvyMsg {
 
-    pub fn parse(buf: &[u8]) -> Result<Self, IvyError> {
-        const SPACE: u8 = ' ' as u8;
-        if let [t, SPACE , right@..] = buf {
-            let msg_id = (*t as char).to_digit(10).unwrap();
-            if let [ident, params] =  right.split(|c| *c == 0x02).collect::<Vec<_>>()[..] {
-                let ident = match std::str::from_utf8(ident).unwrap().parse::<u32>() {
-                    Ok(n) => Ok(n),
-                    Err(_) => Err(IvyError::ParseFail),
-                }?;
-                //let params = params.split(pred)
-                println!("recv msg {} with ident {}, params: {:?}", msg_id, ident, params);
+    pub fn new(msg_id: u32, ident: u32, params: &[u8]) -> Option<Self> {
+        match msg_id {
+            0 => Some(Self::Bye),
+            1 => Some(Self::Sub(ident, std::str::from_utf8(params).unwrap().into())),
+            2 => {
+                let params = params
+                    .split(|c| *c == 0x03)
+                    .map(|buf| std::str::from_utf8(buf).unwrap().into())
+                    .collect();
+                Some(Self::TextMsg(ident, params))
+            },
+            3 => Some(Self::Error(std::str::from_utf8(params).unwrap().into())),
+            4 => Some(Self::DelSub(ident)),
+            5 => Some(Self::EndSub),
+            6 => Some(Self::PeerId(ident as u16, std::str::from_utf8(params).unwrap().into())),
+            7 => Some(Self::DirectMsg(ident, std::str::from_utf8(params).unwrap().into())),
+            8 => Some(Self::Quit),
+            9 => Some(Self::Ping(ident)),
+            10 => Some(Self::Pong(ident)),
+            _ => None
+        }
+    }
 
+    pub fn parse(buf: &[u8]) -> Result<Self, IvyError> {
+        
+        if let [msg_id, ident, params] = buf.splitn(3, |c| *c == ' ' as u8 || *c == 0x02).collect::<Vec<_>>()[..] {
+            let msg_id = std::str::from_utf8(msg_id).unwrap().parse::<u32>()?;
+            let ident = std::str::from_utf8(ident).unwrap().parse::<u32>()?;
+            let ivy_msg = Self::new(msg_id, ident, params);
+            if let Some(ivy_msg) = ivy_msg {
+                return Ok(ivy_msg);
             }
         }
         Err(IvyError::ParseFail)
     }
 
-    pub fn format_ivy(t: u8, ident: u32, params: &str) -> Vec<u8> {
+    pub fn format_ivy(t: u8, ident: u32, params: &[u8]) -> Vec<u8> {
         let mut buffer = Vec::<u8>::new();
         buffer.extend(format!("{} {}", t, ident).as_bytes());
         buffer.push(2);
-        buffer.extend(String::from(params).as_bytes());
+        buffer.extend(params);
         buffer.push('\n' as u8);
         buffer
     }
 
     pub fn to_ascii(&self) -> Vec<u8>  {
-
         match self {
-            IvyMsg::Bye => IvyMsg::format_ivy(u8::from(self), 0, ""),
-            IvyMsg::Sub(ident, reg) => IvyMsg::format_ivy(u8::from(self), *ident, reg),
-            IvyMsg::TextMsg(ident, params) => IvyMsg::format_ivy(u8::from(self), *ident, params),
-            IvyMsg::Error(_) => todo!(),
-            IvyMsg::DelSub(_) => todo!(),
-            IvyMsg::EndSub => IvyMsg::format_ivy(u8::from(self), 0, ""),
-            IvyMsg::PeerId(_, _) => todo!(),
-            IvyMsg::DirectMsg(_, _) => todo!(),
-            IvyMsg::Quit => todo!(),
-            IvyMsg::Ping(_) => todo!(),
-            IvyMsg::Pong(_) => todo!(),
+            IvyMsg::Bye => IvyMsg::format_ivy(u8::from(self), 0, &[]),
+            IvyMsg::Sub(ident, reg) => IvyMsg::format_ivy(u8::from(self), *ident, reg.as_bytes()),
+            IvyMsg::TextMsg(ident, params) => {
+                let params = params
+                    .iter()
+                    .map(|p| p.as_bytes())
+                    .fold(Vec::<u8>::new(), |mut acc, p| {
+                        acc.extend(p);
+                        acc.push(0x03);
+                        acc
+                    });
+                IvyMsg::format_ivy(u8::from(self), *ident, params.as_slice())
+            },
+            IvyMsg::Error(txt) => IvyMsg::format_ivy(u8::from(self), 0, txt.as_bytes()),
+            IvyMsg::DelSub(sub_id) => IvyMsg::format_ivy(u8::from(self), *sub_id, &[]),
+            IvyMsg::EndSub => IvyMsg::format_ivy(u8::from(self), 0, &[]),
+            IvyMsg::PeerId(port, app_name) => IvyMsg::format_ivy(u8::from(self), *port as u32, app_name.as_bytes()),
+            IvyMsg::DirectMsg(ident, msg) => IvyMsg::format_ivy(u8::from(self), *ident, msg.as_bytes()),
+            IvyMsg::Quit => IvyMsg::format_ivy(u8::from(self), 0, &[]),
+            IvyMsg::Ping(ping_id) => IvyMsg::format_ivy(u8::from(self), *ping_id, &[]),
+            IvyMsg::Pong(ping_id) => IvyMsg::format_ivy(u8::from(self), *ping_id, &[]),
         }
     }
 }
