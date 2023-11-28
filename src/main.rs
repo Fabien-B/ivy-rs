@@ -5,7 +5,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bus = IvyBus::new("test");
     
-    match bus.start("127.255.255.255:2010").await {
+    match bus.start("127.255.255.255:1234").await {
         Ok(_) => (),
         Err(e) => println!("{:?}", e),
     }
