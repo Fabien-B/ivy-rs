@@ -11,7 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::thread::sleep(Duration::from_secs(5));
+    bus.stop().await;
 
+    println!("start ended");
     Ok(())
 
 
