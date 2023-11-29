@@ -3,18 +3,19 @@ pub mod ivyerror;
 mod ivy_messages;
 
 // use std::{net::{TcpListener, SocketAddr, TcpStream}, fmt::write, str::FromStr, io::Read, thread::{self, JoinHandle}, sync::{Arc, Mutex}};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{SocketAddr};
+use std::sync::{Arc};
 use std::time::Duration;
 use socket2::{Socket, Domain, Type, Protocol};
 use ivyerror::IvyError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
-use tokio::sync::{futures, Mutex};
+use tokio::net::{TcpListener, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream};
+use tokio::sync::{futures, Mutex, RwLock, mpsc};
 use tokio::time::sleep;
 use tokio::{select, join};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
 //use tokio::time::{sleep, Duration};
 
 use crate::ivy_messages::IvyMsg;
@@ -27,19 +28,14 @@ const PROTOCOL_VERSION: u32 = 3;
 
 pub struct IvyBus {
     pub appname: String,
-    bus: Option<Arc<BusPrivate>>,
-    //port: Option<u16>,
-    token: CancellationToken,
-    
-    //handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
-
-    //bus: Option<BusPrivate>
+    bus: Arc<BusPrivate>,
 }
 
 struct BusPrivate {
-    domain: String,
+    domain: RwLock<String>,
     handles: Mutex<Vec<JoinHandle<()>>>,
-    port: u16
+    port: RwLock<Option<u16>>,
+    token: CancellationToken,
     //subscriptions: Vec<(String, Fn)>,
     //udp_handle: JoinHandle<()>,
     //tcp_handle: JoinHandle<()>,
@@ -52,19 +48,23 @@ struct BusPrivate {
 impl IvyBus {
 
     pub fn new(appname: &str) -> Self {
+
+
+        let bp = BusPrivate {
+            domain: RwLock::new("".into()),
+            handles: Mutex::new(vec![]),
+            port: RwLock::new(None),
+            token: CancellationToken::new()
+        };
+
         IvyBus {
             appname: appname.to_string(),
-            bus: None,
-            //port: None,
-            token: CancellationToken::new(),
+            bus: Arc::new(bp),
             //handles: Arc::new(Mutex::new(vec![])),
         }
     }
 
     pub async fn start(&mut self, domain: &str) -> Result<(), IvyError> {
-
-        
-
         let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         let address: SocketAddr = domain.parse().unwrap();
         udp_socket.set_reuse_address(true)?;
@@ -78,50 +78,31 @@ impl IvyBus {
         //let listener = TcpListener::bind("0.0.0.0:0").await?;
         let listener = TcpListener::bind("0.0.0.0:8888").await?;
         let port = listener.local_addr()?.port();
-        //self.port = Some(port);
+        *self.bus.port.write().await = Some(port);
+        *self.bus.domain.write().await = domain.into();
         println!("listen on TCP {port}");
 
-        self.bus = Some(Arc::new(BusPrivate {
-            domain: domain.into(),
-            handles: Mutex::new(vec![]),
-            port
-        }));
 
+        self.start_udp_watcher(udp_arc, address, self.bus.clone()).await?;
 
-        let token_udp = self.token.clone();
-
-        self.start_udp_watcher(udp_arc, address, token_udp).await?;
-
-
-        let tok = self.token.clone();
-
-        let bus = self.bus.clone().unwrap();
+        let bus = self.bus.clone();
 
         let tcp_listener_handle = tokio::spawn(async move {
+            
             loop {
                 println!("wait for new TCP connection");
                 
                 tokio::select! {
-                    _ = tok.cancelled() => {
+                    _ = bus.token.cancelled() => {
                         println!("wait for TCP connection canceled");
                         break;
                     }
                     Ok((socket, _)) = listener.accept() => {
-                        let (mut read_half, write_half) = socket.into_split();
-                        
                         println!("accepting TCP connection!");
-                        let cloned_token = tok.clone();
+                        let (tx, rx) = mpsc::channel::<u32>(2);
+                        let bp = bus.clone();
                         let h = tokio::spawn(async move {
-                            tokio::select! {
-                                // Step 3: Using cloned token to listen to cancellation requests
-                                _ = cloned_token.cancelled() => {
-                                    println!("task canceled");
-                                    //println!("task canceled {}", read_half.peer_addr().unwrap().port());
-                                }
-                                _ = IvyBus::tcp_read(&mut read_half) => {
-                                    // Long work has completed
-                                }
-                            }
+                            IvyBus::tcp_read(socket, rx, bp).await;
                         });
                         bus.handles.lock().await.push(h);
                     }                    
@@ -131,7 +112,7 @@ impl IvyBus {
 
         });
 
-        self.bus.clone().unwrap().handles.lock().await.push(tcp_listener_handle);
+        self.bus.clone().handles.lock().await.push(tcp_listener_handle);
 
         println!("this is the end");
 
@@ -139,30 +120,33 @@ impl IvyBus {
     }
 
 
-    async fn tcp_read(read_half: &mut OwnedReadHalf) {
+    async fn tcp_read(mut socket: TcpStream, mut rx: mpsc::Receiver<u32>, bp: Arc<BusPrivate>) {
         let mut buf = vec![0; 1024];
-    
-        // In a loop, read data from the socket and write the data back.
+        let tok = bp.token.clone();
         loop {
-            let n = read_half
-                .read(&mut buf)
-                .await
-                .expect("failed to read data from socket");
-            
-                let lines = buf[0..n]
+            tokio::select! {
+                Ok(n) = socket.read(&mut buf) => {
+                    let lines = buf[0..n]
                     .split(|c| *c==b'\n')
                     .filter(|buf| buf.len() > 0);
-                for line in lines {
-                    let msg = IvyMsg::parse(line);
-                    //let s = String::from_utf8(line.to_vec()).unwrap();
-                    //println!("rcv: {s}");
-                    println!("{msg:?}");
+                    for line in lines {
+                        let msg = IvyMsg::parse(line);
+                        println!("{msg:?}");
+                    }
                 }
+                _ = rx.recv() => {
+
+                }
+                _ = tok.cancelled() => {
+                    println!("task canceled");
+                    //println!("task canceled {}", read_half.peer_addr().unwrap().port());
+                }
+            }
         }
     }
 
-    async fn start_udp_watcher(&mut self, udp_arc: Arc<UdpSocket>, address: SocketAddr, token_udp: CancellationToken) -> Result<(), IvyError> {
-        let port = self.bus.clone().ok_or(IvyError::BadDomain)?.port;
+    async fn start_udp_watcher(&mut self, udp_arc: Arc<UdpSocket>, address: SocketAddr, bp: Arc<BusPrivate>) -> Result<(), IvyError> {
+        let port = self.bus.clone().port.read().await.ok_or(IvyError::BadInit)?;
         //let port = self.port.ok_or(IvyError::BadDomain)?;
         // watcherId to be sure no to treat our own announcement message.
         let watcher_id = format!("{}_{}", self.appname, port);
@@ -178,30 +162,34 @@ impl IvyBus {
                 Ok(size) => print!("{size} bytes transmitted!")
             }
 
-            let tok = token_udp.clone();
             loop {
                 let mut buf = vec![0; 1024];
                 println!("udp listen...");
                 tokio::select! {
-                    _ = tok.cancelled() => {
+                    _ = bp.token.cancelled() => {
                         println!("UDP task canceled");
                         break;
                     }
                     Ok((n, src)) = udp_arc.recv_from(&mut buf) => {
-                        println!("received {n} bytes from {src}:");
-                        println!("{}", String::from_utf8(buf[0..n].to_owned()).unwrap());
+                        let rcv_str = String::from_utf8(buf[0..n].to_owned()).unwrap();
+                        if announce == rcv_str {
+                            println!("received back sended annouce");
+                        } else {
+                            println!("UDP rcv: {rcv_str}");
+                        }
                     }                    
                 }
             }
             println!("udp ended");
         });
-        self.bus.clone().unwrap().handles.lock().await.push(handle);
+        self.bus.clone().handles.lock().await.push(handle);
         Ok(())
     }
 
     pub async fn stop(&mut self) {
-        self.token.cancel();
-        for handle in self.bus.clone().unwrap().handles.lock().await.iter_mut() {
+        self.bus.token.cancel();
+        for handle in self.bus.clone().handles.lock().await.iter_mut() {
+            //handle.abort();
             let _ = handle.await;
         }
     }

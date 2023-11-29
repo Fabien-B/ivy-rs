@@ -2,6 +2,7 @@ use std::{io, num::ParseIntError};
 
 #[derive(Debug)]
 pub enum IvyError {
+    BadInit,
     BadDomain,
     IoError(io::Error),
     ParseError(ParseIntError),
