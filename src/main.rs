@@ -1,32 +1,25 @@
 use ivy_rs::IvyBus;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let mut bus = IvyBus::new("test");
+    let _ = bus.start_ivy_loop("127.255.255.255:2010");
     
-    match bus.start("127.255.255.255:1234").await {
-        Ok(_) => (),
-        Err(e) => println!("{:?}", e),
-    }
+    // match bus.start("127.255.255.255:1234").await {
+    //     Ok(_) => (),
+    //     Err(e) => println!("{:?}", e),
+    // }
 
-    std::thread::sleep(Duration::from_secs(5));
-    bus.stop().await;
+    std::thread::sleep(Duration::from_secs(1));
 
-    println!("start ended");
-    Ok(())
+    bus.inspect();
+
+    std::thread::sleep(Duration::from_secs(2));
+    // bus.stop().await;
+
+    // println!("start ended");
+    // Ok(())
 
 
 }
 
-
-
-// fn main() {
-//     std::thread::sleep(Duration::from_secs(3));
-//     bus.send_msg("test");
-//     std::thread::sleep(Duration::from_secs(5));
-
-//     bus.join();
-
-//     println!("Hello, world!");
-// }
