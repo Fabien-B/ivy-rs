@@ -57,7 +57,8 @@ struct IvyPrivate {
     client_connected_cb: Option<Box<dyn Fn() + Send + Sync>>,
     subscriptions: HashMap<u32, (String, Box<dyn Fn(&Vec<String>) + Send + Sync>)>,
     should_terminate: Arc<AtomicBool>,
-    local_port: u16
+    local_port: u16,
+    ivy_handle: Option<JoinHandle<()>>,
 }
 
 impl IvyPrivate {
@@ -68,7 +69,8 @@ impl IvyPrivate {
             client_connected_cb: None,
             subscriptions: HashMap::new(),
             should_terminate: Arc::new(AtomicBool::new(false)),
-            local_port: 0
+            local_port: 0,
+            ivy_handle: None,
         }
     }
 }
@@ -138,6 +140,13 @@ impl IvyBus {
         for h in handles {
             let _ = h.join();
         }
+        println!("peers threads terminated");
+
+        let ivy_handle = self.private.write().unwrap().ivy_handle.take();
+        if let Some(handle) = ivy_handle {
+            let _ = handle.join();
+            println!("ivy thread terminated");
+        }
 
         //TODO
         // join TCPlistener, UDPListener and ivy main thread
@@ -200,24 +209,14 @@ impl IvyBus {
         let (sen_cmd, rcv_cmd) = unbounded::<Command>();
         self.snd = Some(sen_cmd);
         let bus_private = self.private.clone();
-        let _aa = thread::spawn(move || Self::ivy_loop(bus_private, rcv_tcp, rcv_cmd));
+        let ivy_handle = thread::spawn(move || Self::ivy_loop(bus_private, rcv_tcp, rcv_cmd));
+        self.private.write().unwrap().ivy_handle = Some(ivy_handle);
 
         Ok(())
     }
 
     fn ivy_loop(bus_private: Arc<RwLock<IvyPrivate>>, rcv_tcp: Receiver<(TcpStream, SocketAddr)>, rcv_cmd: Receiver<Command>) {
 
-        // let mut bp = bus_private.write().unwrap();
-        // bp.peers.iter().map(|peer| {
-        //     peer.subscriptions.iter().map(|(sub_id, regex)| {
-        //         let re = Regex::new(regex).unwrap();
-        //         if let Some(caps) = re.captures(haystack) {
-        //             caps.iter().map(|sc| println!("{sc:?}"));
-        //         }
-        //     })
-        // });
-        //let peer = Peer {name: String::new(), id: peer_id, subscriptions: vec![], stream: RwLock::new(stream), should_terminate: AtomicCell::new(false)};
-        
         let (sen_peer, rcv_peer) = unbounded::<(u32, IvyMsg)>();
         loop {
             select! {
@@ -250,7 +249,12 @@ impl IvyBus {
                     match msg {
                         Ok((peer_id, msg)) => {
                             match msg {
-                                IvyMsg::Bye => todo!(),
+                                IvyMsg::Bye => {
+                                    let mut bp = bus_private.write().unwrap();
+                                    if let Some(peer) = bp.peers.get_mut(&peer_id) {
+                                        peer.should_terminate.store(true, Ordering::Release);
+                                    }
+                                },
                                 IvyMsg::Sub(sub_id, regex) => {
                                     let mut bp = bus_private.write().unwrap();
                                     if let Some(peer) = bp.peers.get_mut(&peer_id) {
