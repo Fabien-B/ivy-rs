@@ -3,21 +3,24 @@ use std::time::Duration;
 
 fn main() {
     let mut bus = IvyBus::new("test");
+    bus.set_client_connected_cb(Box::new(|| println!("plop")));
+
     let _ = bus.start_ivy_loop("127.255.255.255:2010");
     
-    // match bus.start("127.255.255.255:1234").await {
-    //     Ok(_) => (),
-    //     Err(e) => println!("{:?}", e),
-    // }
-
+    
     std::thread::sleep(Duration::from_secs(1));
 
     bus.inspect();
     std::thread::sleep(Duration::from_secs(1));
 
+
+    bus.subscribe("(yo.*)", Box::new(|params| println!("cb args:{params:?}")));
+    std::thread::sleep(Duration::from_secs(1));
+
+
     bus.send("hello you");
 
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_secs(20));
     // bus.stop().await;
 
     // println!("start ended");
