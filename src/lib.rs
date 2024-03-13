@@ -2,14 +2,16 @@ pub mod ivyerror;
 // mod peer;
 mod ivy_messages;
 
-use std::borrow::{Borrow, BorrowMut};
-use std::io::Read;
-use std::net::{SocketAddr, TcpListener, TcpStream} ; use std::sync::{Arc, Mutex};
+use core::fmt;
+use std::convert::identity;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream} ; use std::sync::{Arc, Mutex, RwLock};
 // , UdpSocket
 //use std::sync::{Arc};
 use std::thread;
 use crossbeam::select;
 use ivy_messages::IvyMsg;
+use regex::Regex;
 //use std::time::Duration;
 use socket2::{Socket, Domain, Type, Protocol};
 use ivyerror::IvyError;
@@ -17,35 +19,60 @@ use ivyerror::IvyError;
 // use peer::Peer;
 // use std::time::Duration;
 use crossbeam::channel::{unbounded, Receiver, Sender};
-use crossbeam::atomic::AtomicCell;
+//use crossbeam::atomic::AtomicCell;
 
 
 
 const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug)]
-struct IvyPrivate {
-    peers: Vec<String>,
-    peers_nb: u32,
+struct Peer {
+    //joinHandle: std::thread::JoinHandle<()>,
+    name: String,
+    id: u32,
+    subscriptions: Vec<(u32, String)>,
+    stream: TcpStream
 }
 
 #[derive(Debug)]
-pub struct IvyBus {
-    pub appname: String,
-    private: Arc<Mutex<IvyPrivate>>
+struct IvyPrivate {
+    peers: Vec<Peer>,
+    peers_nb: u32,
 }
 
+pub struct IvyBus {
+    pub appname: String,
+    private: Arc<RwLock<IvyPrivate>>,
+    snd: Option<Sender<Command>>
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Sub(u32, String),
+    Msg(String),
+    DirectMsg(u32, String),
+    Quit,
+    Stop,
+}
 
 impl IvyBus {
 
     pub fn inspect(&self) {
-        print!("{self:?}");
+        println!("{self:?}");
     }
 
     pub fn new(appname: &str) -> Self {
         IvyBus {
             appname: appname.into(),
-            private: Arc::new(Mutex::new(IvyPrivate { peers: vec![], peers_nb: 0 }))
+            private: Arc::new(RwLock::new(IvyPrivate { peers: vec![], peers_nb: 0 })),
+            snd: None
+        }
+    }
+
+    pub fn send(&self, msg: &str) {
+        let cmd = Command::Msg(msg.into());
+        if let Some(snd) = &self.snd {
+            let _ = snd.send(cmd);
         }
     }
 
@@ -100,14 +127,26 @@ impl IvyBus {
         });
 
         // main Ivy loop
+        let (sen_cmd, rcv_cmd) = unbounded::<Command>();
+        self.snd = Some(sen_cmd);
         let bus_private = self.private.clone();
-        let aa = thread::spawn(move || Self::ivy_loop(bus_private, rcv_tcp));
+        let aa = thread::spawn(move || Self::ivy_loop(bus_private, rcv_tcp, rcv_cmd));
 
         Ok(())
     }
 
-    fn ivy_loop(bus_private: Arc<Mutex<IvyPrivate>>, rcv_tcp: Receiver<(TcpStream, SocketAddr)>) {
-        
+    fn ivy_loop(bus_private: Arc<RwLock<IvyPrivate>>, rcv_tcp: Receiver<(TcpStream, SocketAddr)>, rcv_cmd: Receiver<Command>) {
+
+        // let mut bp = bus_private.write().unwrap();
+        // bp.peers.iter().map(|peer| {
+        //     peer.subscriptions.iter().map(|(sub_id, regex)| {
+        //         let re = Regex::new(regex).unwrap();
+        //         if let Some(caps) = re.captures(haystack) {
+        //             caps.iter().map(|sc| println!("{sc:?}"));
+        //         }
+        //     })
+        // });
+
         
         let (sen_peer, rcv_peer) = unbounded::<(u32, IvyMsg)>();
         loop {
@@ -117,9 +156,12 @@ impl IvyBus {
                         Ok((tcp_stream, addr)) =>  {
                             println!("TCP connection {tcp_stream:?} from {addr:?}");
                             let ss = sen_peer.clone();
-                            let mut bp = bus_private.lock().unwrap();
+                            let mut bp = bus_private.write().unwrap();
                             bp.peers_nb += 1;
                             let peer_id = bp.peers_nb;
+                            let stream = tcp_stream.try_clone().unwrap();
+                            let peer = Peer {name: String::new(), id: peer_id, subscriptions: vec![], stream};
+                            bp.peers.push(peer);
                             thread::spawn(move || Self::tcp_read(tcp_stream, ss, peer_id));
                         },
                         Err(_error) => todo!(),
@@ -131,14 +173,25 @@ impl IvyBus {
                             println!("{msg:?}");
                             match msg {
                                 IvyMsg::Bye => todo!(),
-                                IvyMsg::Sub(_, _) => todo!(),
+                                IvyMsg::Sub(sub_id, regex) => {
+                                    let mut bp = bus_private.write().unwrap();
+                                    for peer in &mut bp.peers {
+                                        if peer.id == peer_id {
+                                            peer.subscriptions.push((sub_id, regex.clone()));
+                                        }
+                                    }
+                                },
                                 IvyMsg::TextMsg(_, _) => todo!(),
                                 IvyMsg::Error(_) => todo!(),
                                 IvyMsg::DelSub(_) => todo!(),
                                 IvyMsg::EndSub => {},
-                                IvyMsg::PeerId(port, name) => {
-                                    let mut aa = bus_private.lock().unwrap();
-                                    aa.peers.push(format!("{peer_id}: {name}"));
+                                IvyMsg::PeerId(_port, name) => {
+                                    let mut bp = bus_private.write().unwrap();
+                                    for peer in &mut bp.peers {
+                                        if peer.id == peer_id {
+                                            peer.name = name.clone();
+                                        }
+                                    }
                                 },
                                 IvyMsg::DirectMsg(_, _) => todo!(),
                                 IvyMsg::Quit => todo!(),
@@ -147,6 +200,44 @@ impl IvyBus {
                             }
                         },
                         Err(_) => todo!(),
+                    }
+                },
+                recv(rcv_cmd) -> msg => {
+                    match msg {
+                        Ok(cmd) => {
+                            match cmd {
+                                Command::Sub(_, _) => todo!(),
+                                Command::Msg(message) => {
+                                    println!("Sending message \"{message}\"...");
+                                    let mut bp = bus_private.write().unwrap();
+                                    for peer in &mut bp.peers {
+                                        peer.subscriptions.iter().for_each(|(sub_id, regex)| {
+                                            // TODO do not recreate the regex each time
+                                            let re = Regex::new(regex).unwrap();
+                                            println!("{regex}");
+                                            if let Some(caps) = re.captures(&message) {
+                                                let params = caps.iter()
+                                                    .skip(1)
+                                                    .filter_map(identity)
+                                                    .map(|c| c.as_str().to_string())
+                                                    .collect::<Vec<_>>();
+                                                let msg = IvyMsg::TextMsg(*sub_id, params);
+                                                let buf = msg.to_ascii();
+                                                let _ = peer.stream.write(&buf);
+                                            }
+                                        })
+                                    }
+                                },
+                                Command::DirectMsg(_id, _msg) => {
+
+                                },
+                                Command::Quit => todo!(),
+                                Command::Stop => todo!(),
+                            }
+                        },
+                        Err(_error) => {
+                            //TODO
+                        }
                     }
                 }
 
@@ -192,3 +283,14 @@ impl IvyBus {
 
 }
 
+
+impl fmt::Debug for IvyBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{\"{}\"", self.appname)?;
+        let p = self.private.read().unwrap();
+        f.debug_struct("IvyBus")
+            .field("appname", &self.appname)
+            .field("private", &format_args!("{:?}", *p))
+            .finish()
+    }
+}

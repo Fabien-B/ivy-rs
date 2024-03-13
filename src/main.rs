@@ -13,8 +13,11 @@ fn main() {
     std::thread::sleep(Duration::from_secs(1));
 
     bus.inspect();
+    std::thread::sleep(Duration::from_secs(1));
 
-    std::thread::sleep(Duration::from_secs(2));
+    bus.send("hello you");
+
+    std::thread::sleep(Duration::from_secs(1));
     // bus.stop().await;
 
     // println!("start ended");
