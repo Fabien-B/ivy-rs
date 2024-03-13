@@ -55,7 +55,7 @@ impl Peer {
 
 
 struct IvyPrivate {
-    peers: Vec<Peer>,
+    peers: HashMap<u32, Peer>,
     peers_nb: u32,
     client_connected_cb: Option<Box<dyn Fn() + Send + Sync>>,
     subscriptions: HashMap<u32, (String, Box<dyn Fn(&Vec<String>) + Send + Sync>)>,
@@ -66,7 +66,7 @@ struct IvyPrivate {
 impl IvyPrivate {
     fn new() -> Self {
         IvyPrivate {
-            peers: vec![],
+            peers: HashMap::new(),
             peers_nb: 0,
             client_connected_cb: None,
             subscriptions: HashMap::new(),
@@ -148,7 +148,6 @@ impl IvyBus {
 
         //let listener = TcpListener::bind("0.0.0.0:0")?;
         let listener = TcpListener::bind("0.0.0.0:8888")?;
-        let local_addr = listener.local_addr()?;
         let port = listener.local_addr()?.port();
         self.private.write().unwrap().local_port = port;
         println!("listen on TCP {port}");
@@ -232,7 +231,7 @@ impl IvyBus {
                                 connected_cb();
                             }
                             
-                            bp.peers.push(peer);
+                            bp.peers.insert(peer_id, peer);
                             thread::spawn(move || Self::tcp_read(tcp_stream, ss, peer_id, term));
                             
                         },
@@ -246,10 +245,8 @@ impl IvyBus {
                                 IvyMsg::Bye => todo!(),
                                 IvyMsg::Sub(sub_id, regex) => {
                                     let mut bp = bus_private.write().unwrap();
-                                    for peer in &mut bp.peers {
-                                        if peer.id == peer_id {
-                                            peer.subscriptions.push((sub_id, regex.clone()));
-                                        }
+                                    if let Some(peer) = bp.peers.get_mut(&peer_id) {
+                                        peer.subscriptions.push((sub_id, regex.clone()));
                                     }
                                 },
                                 IvyMsg::TextMsg(sub_id, params) => {
@@ -263,27 +260,22 @@ impl IvyBus {
                                 IvyMsg::DelSub(_) => todo!(),
                                 IvyMsg::EndSub => {
                                     let bp = bus_private.write().unwrap();
-                                    for peer in &bp.peers {
-                                        if peer.id == peer_id {
-
-                                            for (sub_id, (regex, _cb)) in bp.subscriptions.iter() {
-                                                let msg = IvyMsg::Sub(*sub_id, regex.clone());
-                                                let buf = msg.to_ascii();
-                                                let _ = peer.stream.write().unwrap().write(&buf);
-                                            }
-
-                                            let msg = IvyMsg::EndSub;
+                                    if let Some(peer) = bp.peers.get(&peer_id) {
+                                        for (sub_id, (regex, _cb)) in bp.subscriptions.iter() {
+                                            let msg = IvyMsg::Sub(*sub_id, regex.clone());
                                             let buf = msg.to_ascii();
                                             let _ = peer.stream.write().unwrap().write(&buf);
                                         }
+
+                                        let msg = IvyMsg::EndSub;
+                                        let buf = msg.to_ascii();
+                                        let _ = peer.stream.write().unwrap().write(&buf);
                                     }
                                 },
                                 IvyMsg::PeerId(_port, name) => {
                                     let mut bp = bus_private.write().unwrap();
-                                    for peer in &mut bp.peers {
-                                        if peer.id == peer_id {
-                                            peer.name = name.clone();
-                                        }
+                                    if let Some(peer) = bp.peers.get_mut(&peer_id) {
+                                        peer.name = name.clone();
                                     }
                                 },
                                 IvyMsg::DirectMsg(_, _) => todo!(),
@@ -302,7 +294,7 @@ impl IvyBus {
                                 Command::Sub(sub_id, regex) => {
                                     println!("Subscribe to\"{regex}\" with id {sub_id}");
                                     let bp = bus_private.write().unwrap();
-                                    for peer in &bp.peers {
+                                    for peer in bp.peers.values() {
                                         let msg = IvyMsg::Sub(sub_id, regex.clone());
                                         let buf = msg.to_ascii();
                                         let _ = peer.stream.write().unwrap().write(&buf);
@@ -311,7 +303,7 @@ impl IvyBus {
                                 Command::Msg(message) => {
                                     println!("Sending message \"{message}\"");
                                     let bp = bus_private.write().unwrap();
-                                    for peer in &bp.peers {
+                                    for peer in bp.peers.values() {
                                         peer.subscriptions.iter().for_each(|(sub_id, regex)| {
                                             // TODO do not recreate the regex each time
                                             let re = Regex::new(regex).unwrap();
@@ -335,7 +327,7 @@ impl IvyBus {
                                 Command::Quit => todo!(),
                                 Command::Stop => {
                                     let bp = bus_private.write().unwrap();
-                                    for peer in &bp.peers {
+                                    for peer in bp.peers.values() {
                                         peer.should_terminate.store(true, Ordering::Release);
                                     }
                                     // TODO
