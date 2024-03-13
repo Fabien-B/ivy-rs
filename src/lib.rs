@@ -3,7 +3,6 @@ pub mod ivyerror;
 mod ivy_messages;
 
 use core::fmt;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::io::{Read, Write};
@@ -33,7 +32,6 @@ const PROTOCOL_VERSION: u32 = 3;
 struct Peer {
     //joinHandle: std::thread::JoinHandle<()>,
     name: String,
-    id: u32,
     subscriptions: Vec<(u32, String)>,
     stream: RwLock<TcpStream>,
     should_terminate: Arc<AtomicBool>,
@@ -41,10 +39,9 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(peer_id: u32, stream: TcpStream) -> Self {
+    fn new(stream: TcpStream) -> Self {
         Peer {
             name: String::new(),
-            id: peer_id,
             subscriptions: vec![],
             stream: RwLock::new(stream),
             should_terminate: Arc::new(AtomicBool::new(false)),
@@ -132,8 +129,18 @@ impl IvyBus {
         if let Some(snd) = &self.snd {
             let _ = snd.send(Command::Stop);
         }
+
+
+        let handles: Vec<_> = self.private.write().unwrap().peers.values_mut()
+            .filter_map(|peer| peer.join_handle.take())
+            .collect();
+
+        for h in handles {
+            let _ = h.join();
+        }
+
         //TODO
-        // join all threads
+        // join TCPlistener, UDPListener and ivy main thread
 
     }
 
@@ -223,16 +230,17 @@ impl IvyBus {
                             bp.peers_nb += 1;
                             let peer_id = bp.peers_nb;
                             let stream = tcp_stream.try_clone().unwrap();
-                            let peer = Peer::new(peer_id, stream);
-                            let term = peer.should_terminate.clone();
+                            let mut peer = Peer::new(stream);
+                            let term = peer.should_terminate.clone();                            
+
+                            let handle = thread::spawn(move || Self::tcp_read(tcp_stream, ss, peer_id, term));
                             
+                            peer.join_handle = Some(handle);
+                            bp.peers.insert(peer_id, peer);
 
                             if let Some(connected_cb) = &bp.client_connected_cb {
                                 connected_cb();
                             }
-                            
-                            bp.peers.insert(peer_id, peer);
-                            thread::spawn(move || Self::tcp_read(tcp_stream, ss, peer_id, term));
                             
                         },
                         Err(_error) => todo!(),
