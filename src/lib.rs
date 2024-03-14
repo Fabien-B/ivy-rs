@@ -29,7 +29,7 @@ const UDPLISTENER_THD_ID: u32 = 1;
 #[derive(Debug)]
 pub struct Peer {
     name: String,
-    subscriptions: Vec<(u32, String)>,
+    subscriptions: HashMap<u32, String>,
     stream: RwLock<TcpStream>,
     should_terminate: Arc<AtomicBool>,
 }
@@ -38,7 +38,7 @@ impl Peer {
     fn new(stream: TcpStream) -> Self {
         Peer {
             name: String::new(),
-            subscriptions: vec![],
+            subscriptions: HashMap::new(),
             stream: RwLock::new(stream),
             should_terminate: Arc::new(AtomicBool::new(false)),
             //join_handle: None
@@ -60,12 +60,16 @@ struct PeerData {
 
 type IvyCb = Box<dyn Fn(&Peer, Vec<String>) + Send + Sync>;
 type IvyPeerConnectedCb = Box<dyn Fn(&Peer) + Send + Sync>;
+type IvyDirectMessageCb = Box<dyn Fn(&Peer, u32, String) + Send + Sync>;
+type IvyQuitCb = Box<dyn Fn(&Peer) + Send + Sync>;
 
 struct IvyPrivate {
     appname: String,
     peers: HashMap<u32, Peer>,
     next_thread_id: AtomicCell<u32>,
     client_connected_cb: Option<IvyPeerConnectedCb>,
+    direct_message_cb: Option<IvyDirectMessageCb>,
+    quit_cb: Option<IvyQuitCb>,
     subscriptions: HashMap<u32, (String, IvyCb)>,
     should_terminate: Arc<AtomicBool>,
     local_port: u16,
@@ -80,6 +84,8 @@ impl IvyPrivate {
             peers: HashMap::new(),
             next_thread_id: AtomicCell::new(2),
             client_connected_cb: None,
+            direct_message_cb: None,
+            quit_cb: None,
             subscriptions: HashMap::new(),
             should_terminate: Arc::new(AtomicBool::new(false)),
             local_port: 0,
@@ -106,6 +112,8 @@ pub enum Command {
     SendDirectMsg(u32, u32, String),
     /// Unsubscribe from a regex
     UnSub(u32),
+    /// Ping peer
+    Ping(u32),
     /// Stop Ivy
     Stop,
 }
@@ -172,6 +180,16 @@ impl IvyBus {
     /// Set a callback that will be called when a new peer is connected
     pub fn set_client_connected_cb(&mut self, cb: IvyPeerConnectedCb) {
         self.private.write().unwrap().client_connected_cb = Some(cb);
+    }
+
+    /// Set a callback that will be called on direct message
+    pub fn set_direct_message_cb(&mut self, cb: IvyDirectMessageCb) {
+        self.private.write().unwrap().direct_message_cb = Some(cb);
+    }
+
+    /// Set a callback that will be called on quit request
+    pub fn set_quit_cb(&mut self, cb: IvyQuitCb) {
+        self.private.write().unwrap().quit_cb = Some(cb);
     }
 
     /// Stop the bus
@@ -461,7 +479,7 @@ impl IvyBus {
                 // Add a regex to a peer's subscriptions
                 let mut bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get_mut(&peer_id) {
-                    peer.subscriptions.push((sub_id, regex.clone()));
+                    peer.subscriptions.insert(sub_id, regex.clone());
                 }
             },
             IvyMsg::TextMsg(sub_id, params) => {
@@ -477,9 +495,10 @@ impl IvyBus {
             },
             IvyMsg::Error(_) => todo!(),
             IvyMsg::DelSub(sub_id) => {
+                // remove regex from a peer
                 let mut bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get_mut(&peer_id) {
-                    //peer.subscriptions.;
+                    peer.subscriptions.remove(&sub_id);
                 }
             },
             IvyMsg::EndSub => {
@@ -489,19 +508,42 @@ impl IvyBus {
                     if let Some(peer) = bp.peers.get(&peer_id) {
                         connected_cb(&peer);
                     }
-                    
                 }
             },
             IvyMsg::PeerId(_port, name) => {
+                // identify the peer
                 let mut bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get_mut(&peer_id) {
                     peer.name = name.clone();
                 }
             },
-            IvyMsg::DirectMsg(_, _) => todo!(),
-            IvyMsg::Quit => todo!(),
-            IvyMsg::Ping(_) => todo!(),
-            IvyMsg::Pong(_) => todo!(),
+            IvyMsg::DirectMsg(id, msg) => {
+                // call the direct message callback
+                let bp = bus_private.read().unwrap();
+                if let Some(direct_message_cb) = &bp.direct_message_cb {
+                    if let Some(peer) = bp.peers.get(&peer_id) {
+                        direct_message_cb(&peer, id, msg);
+                    }
+                }
+            },
+            IvyMsg::Quit => {
+                // call the quit callback
+                let bp = bus_private.read().unwrap();
+                if let Some(quit_cb) = &bp.quit_cb {
+                    if let Some(peer) = bp.peers.get(&peer_id) {
+                        quit_cb(&peer);
+                    }
+                }
+            },
+            IvyMsg::Ping(ping_id) => {
+                // respond with pong
+                let mut bp = bus_private.write().unwrap();
+                if let Some(peer) = bp.peers.get_mut(&peer_id) {
+                    let msg = IvyMsg::Pong(ping_id);
+                    let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
+                }
+            },
+            IvyMsg::Pong(_pong_id) => todo!(),
         }
     }
 
@@ -548,6 +590,9 @@ impl IvyBus {
                     let msg = IvyMsg::DelSub(sub_id);
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
+            },
+            Command::Ping(_peer_id) => {
+                todo!()
             },
             Command::Stop => {
                 // say Bye to all threads
