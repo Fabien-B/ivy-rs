@@ -9,19 +9,13 @@ use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream} ; use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-// , UdpSocket
-//use std::sync::{Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use crossbeam::select;
 use ivy_messages::{IvyMsg, parse_udp_announce};
 use regex::Regex;
-//use std::time::Duration;
 use socket2::{Domain, Protocol, Socket, Type};
 use ivyerror::IvyError;
-//use crate::ivy_messages::IvyMsg;
-// use peer::Peer;
-// use std::time::Duration;
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use crossbeam::atomic::AtomicCell;
 
@@ -33,13 +27,11 @@ const TCPLISTENER_THD_ID: u32 = 0;
 const UDPLISTENER_THD_ID: u32 = 1;
 
 #[derive(Debug)]
-struct Peer {
-    //joinHandle: std::thread::JoinHandle<()>,
+pub struct Peer {
     name: String,
     subscriptions: Vec<(u32, String)>,
     stream: RwLock<TcpStream>,
     should_terminate: Arc<AtomicBool>,
-    //join_handle: Option<JoinHandle<()>>
 }
 
 impl Peer {
@@ -52,8 +44,11 @@ impl Peer {
             //join_handle: None
         }
     }
-}
 
+    pub fn get_name(&self) -> String {
+        self.name.clone()
+    }
+}
 
 struct PeerData {
     socket: TcpStream,
@@ -63,12 +58,15 @@ struct PeerData {
     snd_thd_terminated: Sender<u32>,
 }
 
+type IvyCb = Box<dyn Fn(&Peer, Vec<String>) + Send + Sync>;
+type IvyPeerConnectedCb = Box<dyn Fn(&Peer) + Send + Sync>;
+
 struct IvyPrivate {
     appname: String,
     peers: HashMap<u32, Peer>,
     next_thread_id: AtomicCell<u32>,
-    client_connected_cb: Option<Box<dyn Fn() + Send + Sync>>,
-    subscriptions: HashMap<u32, (String, Box<dyn Fn(&Vec<String>) + Send + Sync>)>,
+    client_connected_cb: Option<IvyPeerConnectedCb>,
+    subscriptions: HashMap<u32, (String, IvyCb)>,
     should_terminate: Arc<AtomicBool>,
     local_port: u16,
     ivy_thd_handle: Option<JoinHandle<()>>,
@@ -97,21 +95,22 @@ pub struct IvyBus {
     next_sub_id: AtomicCell<u32>,
 }
 
-//#[derive(Debug)]
+/// Commands from application to Ivy thread
 pub enum Command {
+    /// Subscribe to a regex
     Sub(u32, String),
-    Msg(String),
-    DirectMsg(u32, String),
-    Quit,
+    /// Send message to peers (matching)
+    SendMsg(String),
+    /// Send a direct message to a peer (unique peer, no matching)
+    /// (peer_id, id, msg)
+    SendDirectMsg(u32, u32, String),
+    /// Unsubscribe from a regex
+    UnSub(u32),
+    /// Stop Ivy
     Stop,
-    SetClientConnectedCb(Box<dyn Fn() + Send + Sync>)
 }
 
 impl IvyBus {
-
-    pub fn inspect(&self) {
-        println!("{self:?}");
-    }
 
     pub fn new(appname: &str) -> Self {
         IvyBus {
@@ -121,14 +120,28 @@ impl IvyBus {
         }
     }
 
+    /// Send text message (matching)
     pub fn send(&self, msg: &str) {
         if let Some(snd) = &self.snd {
-            let _ = snd.send(Command::Msg(msg.into()));
+            let _ = snd.send(Command::SendMsg(msg.into()));
         }
     }
 
-    pub fn subscribe(&self, regex: &str, cb: Box<dyn Fn(&Vec<String>) + Send + Sync>) {
+    /// Send Direct message to a peer
+    pub fn send_direct_msg(&self, peer_id: u32, id:u32, msg: String) {
+        if let Some(snd) = &self.snd {
+            let _ = snd.send(Command::SendDirectMsg(peer_id, id, msg));
+        }
+    }
 
+    /// Subscribe to a regex
+    /// # Parameters
+    /// `regex`: the regex to match messages against
+    /// 
+    /// `cb`: A callback of the form `fn(peer: &Peer, params: Vec<String>)`
+    /// # Return value
+    /// Returns a `sub_id: u32` that can be used to unsubscribe from that regex
+    pub fn subscribe(&self, regex: &str, cb: IvyCb) -> u32 {
         let mut bp = self.private.write().unwrap();
         let sub_id = self.next_sub_id.fetch_add(1);
         bp.subscriptions.insert(sub_id, (regex.into(), cb));
@@ -138,12 +151,30 @@ impl IvyBus {
             let cmd = Command::Sub(sub_id, regex.into());
             let _ = snd.send(cmd);
         }
+        // return subscription id
+        sub_id
     }
 
-    pub fn set_client_connected_cb(&mut self, cb: Box<dyn Fn() + Send + Sync>) {
+    /// Unsubscribe from a regex
+    /// # Arguments
+    /// `sub_id: u32`: regex identifier, as returned by the `subscribe` method
+    pub fn unsubscribe(&self, sub_id: u32) {
+        let mut bp = self.private.write().unwrap();
+        bp.subscriptions.remove(&sub_id);
+
+        // if ivy loop is running, send a message
+        if let Some(snd) = &self.snd {
+            let cmd = Command::UnSub(sub_id);
+            let _ = snd.send(cmd);
+        }
+    }
+
+    /// Set a callback that will be called when a new peer is connected
+    pub fn set_client_connected_cb(&mut self, cb: IvyPeerConnectedCb) {
         self.private.write().unwrap().client_connected_cb = Some(cb);
     }
 
+    /// Stop the bus
     pub fn stop(&self) {
         if let Some(snd) = &self.snd {
             let _ = snd.send(Command::Stop);
@@ -158,20 +189,8 @@ impl IvyBus {
 
     }
 
-    fn make_udp_socket(domain: &str) -> Result<(Socket, SocketAddr), IvyError> {
-        let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        let address: SocketAddr = domain.parse().unwrap();
-        udp_socket.set_reuse_address(true)?;
-        udp_socket.set_broadcast(true)?;
-        let _ = udp_socket.set_read_timeout(Some(Duration::from_millis(10)));
-        udp_socket.bind(&address.into())?;
-        Ok((udp_socket, address))
-    }
-
-    pub fn start_ivy_loop(&mut self, domain: &str) -> Result<(), IvyError> {
-
-
-
+    /// Start Ivy
+    pub fn start(&mut self, domain: &str) -> Result<(), IvyError> {
         // create TCPListener and bind it 
         let listener = TcpListener::bind("0.0.0.0:0")?;
         let port = listener.local_addr()?.port();
@@ -230,7 +249,15 @@ impl IvyBus {
         Ok(())
     }
 
-
+    fn make_udp_socket(domain: &str) -> Result<(Socket, SocketAddr), IvyError> {
+        let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let address: SocketAddr = domain.parse().unwrap();
+        udp_socket.set_reuse_address(true)?;
+        udp_socket.set_broadcast(true)?;
+        let _ = udp_socket.set_read_timeout(Some(Duration::from_millis(10)));
+        udp_socket.bind(&address.into())?;
+        Ok((udp_socket, address))
+    }
 
 
     fn udp_listener(
@@ -295,13 +322,21 @@ impl IvyBus {
         let _ = snd_term.send(UDPLISTENER_THD_ID);
     }
 
+    fn send_initial_subscriptions(stream: &mut TcpStream, subscriptions: &HashMap<u32, (String, IvyCb)>) {
+        // send Initial Subscriptions
+        for (sub_id, (regex, _)) in subscriptions.iter() {
+            let msg = IvyMsg::Sub(*sub_id, regex.clone());
+            let _ = stream.write(&msg.to_ascii());
+        }
+        // send end of initial subsciption
+        let buf = IvyMsg::EndSub.to_ascii();
+        let _ = stream.write(&buf);
+    }
+
     fn ivy_loop(bus_private: Arc<RwLock<IvyPrivate>>, rcv_tcp: Receiver<(TcpStream, SocketAddr)>, rcv_cmd: Receiver<Command>, rcv_udp: Receiver<(SocketAddr, String)>,
     snd_thd_terminated: Sender<u32>, rcv_thd_terminated: Receiver<u32>) {
 
         let (sen_peer, rcv_peer) = unbounded::<(u32, IvyMsg)>();
-
-
-        
 
         loop {
             select! {
@@ -314,7 +349,7 @@ impl IvyBus {
                 // message from peer
                 recv(rcv_peer) -> msg => {
                     if let Ok((peer_id, msg)) = msg {
-                        Self::handle_ivymsg(peer_id, &msg, &bus_private);
+                        Self::handle_ivymsg(peer_id, msg, &bus_private);
                     }
                 },
                 // command from application
@@ -335,7 +370,7 @@ impl IvyBus {
                             peer.name = peer_name;
                             let peer_id = bp.next_thread_id.fetch_add(1);
 
-                            let pd = PeerData{
+                            let pd = PeerData {
                                 socket: stream_tcp_read,
                                 snd_ivymsg: sen_peer.clone(),
                                 peer_id,
@@ -350,16 +385,8 @@ impl IvyBus {
                             let msg = IvyMsg::PeerId(bp.local_port, bp.appname.clone());
                             let buf = msg.to_ascii();
                             let _ = stream.write(&buf);
-                            // send Initial Subscriptions
-                            for (sub_id, (regex, _)) in bp.subscriptions.iter() {
-                                let msg = IvyMsg::Sub(*sub_id, regex.clone());
-                                let buf = msg.to_ascii();
-                                let _ = stream.write(&buf);
-                            }
-                            // send end of initial subsciption
-                            let buf = IvyMsg::EndSub.to_ascii();
-                            let _ = stream.write(&buf);
-                    }
+                            Self::send_initial_subscriptions(&mut stream, &bp.subscriptions);
+                        }
                     }
                 }
                 // notification thread termination
@@ -400,9 +427,10 @@ impl IvyBus {
         let mut bp = bus_private.write().unwrap();
         let peer_id = bp.next_thread_id.fetch_add(1);
         let stream = tcp_stream.try_clone().unwrap();
+        let mut stream_init_subs = tcp_stream.try_clone().unwrap();
         let peer = Peer::new(stream);
 
-        let pd = PeerData{
+        let pd = PeerData {
             socket: tcp_stream,
             snd_ivymsg: sen_peer.clone(),
             peer_id,
@@ -412,52 +440,56 @@ impl IvyBus {
 
         let handle = thread::spawn(move || Self::tcp_read(pd));
         bp.join_handles.insert(peer_id, handle);
-        bp.peers.insert(peer_id, peer);
 
-        if let Some(connected_cb) = &bp.client_connected_cb {
-            connected_cb();
-        }
-        
+        bp.peers.insert(peer_id, peer);
+        Self::send_initial_subscriptions(&mut stream_init_subs, &bp.subscriptions);
     }
 
     /// Handle messages coming from a peer socket
     /// 
     /// See the details of the messages here: https://ivybus.gitlab.io/protocol_messages.html#messages
-    fn handle_ivymsg(peer_id: u32, msg: &IvyMsg, bus_private: &Arc<RwLock<IvyPrivate>>) {
+    fn handle_ivymsg(peer_id: u32, msg: IvyMsg, bus_private: &Arc<RwLock<IvyPrivate>>) {
         match msg {
             IvyMsg::Bye => {
+                // terminate peer thread
                 let mut bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get_mut(&peer_id) {
                     peer.should_terminate.store(true, Ordering::Release);
                 }
             },
             IvyMsg::Sub(sub_id, regex) => {
+                // Add a regex to a peer's subscriptions
                 let mut bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get_mut(&peer_id) {
-                    peer.subscriptions.push((*sub_id, regex.clone()));
+                    peer.subscriptions.push((sub_id, regex.clone()));
                 }
             },
             IvyMsg::TextMsg(sub_id, params) => {
-                //println!("params:: {params:?}");
+                // call the callback associated with the subscription
                 let bp = bus_private.write().unwrap();
                 if let Some((_regex, cb)) = bp.subscriptions.get(&sub_id) {
-                    cb(&params);
+                    if let Some(peer) = bp.peers.get(&peer_id) {
+                        cb(&peer, params);
+                        //TODO execute in a thread ?
+                        //thread::spawn(move || cb(params));
+                    }
                 }
             },
             IvyMsg::Error(_) => todo!(),
-            IvyMsg::DelSub(_) => todo!(),
+            IvyMsg::DelSub(sub_id) => {
+                let mut bp = bus_private.write().unwrap();
+                if let Some(peer) = bp.peers.get_mut(&peer_id) {
+                    //peer.subscriptions.;
+                }
+            },
             IvyMsg::EndSub => {
-                let bp = bus_private.write().unwrap();
-                if let Some(peer) = bp.peers.get(&peer_id) {
-                    for (sub_id, (regex, _cb)) in bp.subscriptions.iter() {
-                        let msg = IvyMsg::Sub(*sub_id, regex.clone());
-                        let buf = msg.to_ascii();
-                        let _ = peer.stream.write().unwrap().write(&buf);
+                // Peer connected and initialized
+                let bp = bus_private.read().unwrap();
+                if let Some(connected_cb) = &bp.client_connected_cb {
+                    if let Some(peer) = bp.peers.get(&peer_id) {
+                        connected_cb(&peer);
                     }
-
-                    let msg = IvyMsg::EndSub;
-                    let buf = msg.to_ascii();
-                    let _ = peer.stream.write().unwrap().write(&buf);
+                    
                 }
             },
             IvyMsg::PeerId(_port, name) => {
@@ -479,22 +511,18 @@ impl IvyBus {
     fn handle_command(cmd: Command, bus_private: &Arc<RwLock<IvyPrivate>>) {
         match cmd {
             Command::Sub(sub_id, regex) => {
-                println!("Subscribe to\"{regex}\" with id {sub_id}");
                 let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     let msg = IvyMsg::Sub(sub_id, regex.clone());
-                    let buf = msg.to_ascii();
-                    let _ = peer.stream.write().unwrap().write(&buf);
+                    let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
             },
-            Command::Msg(message) => {
-                println!("Sending message \"{message}\"");
+            Command::SendMsg(message) => {
                 let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     peer.subscriptions.iter().for_each(|(sub_id, regex)| {
                         // TODO do not recreate the regex each time
                         let re = Regex::new(regex).unwrap();
-                        println!("{regex}");
                         if let Some(caps) = re.captures(&message) {
                             let params = caps.iter()
                                 .skip(1)
@@ -502,42 +530,42 @@ impl IvyBus {
                                 .map(|c| c.as_str().to_string())
                                 .collect::<Vec<_>>();
                             let msg = IvyMsg::TextMsg(*sub_id, params);
-                            let buf = msg.to_ascii();
-                            let _ = peer.stream.write().unwrap().write(&buf);
+                            let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                         }
                     })
                 }
             },
-            Command::DirectMsg(_id, _msg) => {
-                // call dedicated callback
-                todo!()
+            Command::SendDirectMsg(peer_id, id, msg) => {
+                let bp = bus_private.write().unwrap();
+                if let Some(peer) = bp.peers.get(&peer_id) {
+                    let msg = IvyMsg::DirectMsg(id, msg);
+                    let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
+                }
             },
-            Command::Quit => {
-                // vasistas ?
-                todo!()
+            Command::UnSub(sub_id) => {
+                let bp = bus_private.write().unwrap();
+                for peer in bp.peers.values() {
+                    let msg = IvyMsg::DelSub(sub_id);
+                    let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
+                }
             },
             Command::Stop => {
+                // say Bye to all threads
                 let bp = bus_private.write().unwrap();
-                bp.should_terminate.store(true, Ordering::Release);
-                
-                // try trigger TCPListener
-                // let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), bp.local_port);
-                // if TcpStream::connect_timeout(&local_addr, Duration::from_secs(1)).is_ok() {
-                //     println!("Listener closing...");
-                // }
+                for peer in bp.peers.values() {
+                    let buf = IvyMsg::Bye.to_ascii();
+                    let _ = peer.stream.write().unwrap().write(&buf);
+                }
 
-                //TODO
-                // join TCPlistener, UDPListener
-
+                // Ask all peer threads to terminate
                 for peer in bp.peers.values() {
                     peer.should_terminate.store(true, Ordering::Release);
                 }
 
-                //break;
-            },
-            Command::SetClientConnectedCb(cb) => {
-                let mut bp = bus_private.write().unwrap();
-                bp.client_connected_cb = Some(cb);
+                // TODO try trigger TCPListener
+
+                // remember we have to terminate
+                bp.should_terminate.store(true, Ordering::Release);
             }
         }
     }
@@ -549,25 +577,17 @@ impl IvyBus {
     /// Report terminaison via the `snd_thd_terminated` channel
     fn tcp_listener(listener: TcpListener, sen_tcp: Sender<(TcpStream, SocketAddr)>, term: Arc<AtomicBool>,
                     snd_thd_terminated: Sender<u32>) {
-        
         loop
         {
             match listener.accept() {
                 Ok((tcp_stream, addr)) => {
-                    if term.load(Ordering::Acquire) {
-                        println!("Exiting TCPListener thread...");
-                        break;
-                    }
+                    if term.load(Ordering::Acquire) { break; }
                     let _ = sen_tcp.send((tcp_stream, addr));
                 },
-                Err(_error) => {
-
-                },
+                Err(_error) => {},
             }
         }
         let _ = snd_thd_terminated.send(TCPLISTENER_THD_ID);
-        println!("Exit TCPListener thread");
-
     }
 
     /// Receive and parse messages coming from a Peer.
@@ -576,22 +596,19 @@ impl IvyBus {
     /// 
     /// Report terminaison via the `data.snd_thd_terminated` channel
     fn tcp_read(mut data: PeerData) {
-        println!("new peer thread");
         let mut buf = vec![0; 1024];
         let _ = data.socket.set_read_timeout(Some(Duration::from_millis(10)));
         loop {
             match data.socket.read(&mut buf) {
                 Ok(n) => {
-                    if n == 0 {
-                        // socket closed
-                        break;
-                    }
+                    // socket closed
+                    if n == 0 { break; }
+
                     let lines = buf[0..n]
                     .split(|c| *c==b'\n')
                     .filter(|buf| buf.len() > 0);
                     for line in lines {
-                        let msg = IvyMsg::parse(line);
-                        if let Ok(msg) = msg {
+                        if let Ok(msg) = IvyMsg::parse(line) {
                             let _ = data.snd_ivymsg.send((data.peer_id, msg));
                         }
                     }
@@ -612,7 +629,6 @@ impl IvyBus {
             }
         }
         let _ = data.snd_thd_terminated.send(data.peer_id);
-        //println!("Exit thread peer {}", data.peer_id);
     }
 
 }
