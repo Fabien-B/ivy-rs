@@ -24,10 +24,11 @@ impl IvyMsg {
             0 => Some(Self::Bye),
             1 => Some(Self::Sub(ident, std::str::from_utf8(params).unwrap().into())),
             2 => {
-                let params = params
+                let mut params: Vec<_> = params
                     .split(|c| *c == 0x03)
                     .map(|buf| std::str::from_utf8(buf).unwrap().into())
                     .collect();
+                params.pop();
                 Some(Self::TextMsg(ident, params))
             },
             3 => Some(Self::Error(std::str::from_utf8(params).unwrap().into())),
