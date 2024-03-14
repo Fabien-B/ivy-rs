@@ -17,8 +17,8 @@ fn main() {
     bus.send("hello you");
     std::thread::sleep(Duration::from_secs(1));
 
-    //bus.stop();
-    //println!("stopped!");
+    bus.stop();
+    println!("stopped!");
 
     std::thread::sleep(Duration::from_secs(20));
     // bus.stop().await;
