@@ -202,7 +202,6 @@ impl IvyBus {
         let ivy_handle = self.private.write().unwrap().ivy_thd_handle.take();
         if let Some(handle) = ivy_handle {
             let _ = handle.join();
-            println!("ivy thread terminated");
         }
 
     }
@@ -299,8 +298,6 @@ impl IvyBus {
         loop
         {
             if let Ok((n, src)) = udp_socket.recv_from(&mut _buf) {
-                println!("UDP received {n} bytes from {src:?}");
-
                 // DANGER! Do not read the buffer past the nth element !
                 // Assume all array is initialized: this is false!
                 // See socket2 recv method : promise it's fine for the [0..n] slice
@@ -318,7 +315,6 @@ impl IvyBus {
                         continue;
                     }
                     
-                    println!("announce: {watcher_id} / {my_watcher_id}");
                     // send (port, peer_name) to ivy thread
                     if let Some(addr) = src.as_socket() {
                         let ip = addr.ip();
@@ -360,8 +356,8 @@ impl IvyBus {
             select! {
                 // new TCP connection
                 recv(rcv_tcp) -> msg => {
-                    if let Ok((tcp_stream, addr)) = msg {
-                        Self::handle_tcp_connection(tcp_stream, addr, &snd_thd_terminated, &bus_private, &sen_peer);
+                    if let Ok((tcp_stream, _addr)) = msg {
+                        Self::handle_tcp_connection(tcp_stream, &snd_thd_terminated, &bus_private, &sen_peer);
                     }
                 },
                 // message from peer
@@ -417,8 +413,8 @@ impl IvyBus {
                         }
 
                         // remove the associated peer (if it's a peer thread)
-                        if let Some(peer) = bp.peers.remove(&thread_id) {
-                            println!("droping peer {}", peer.name);   
+                        if let Some(_peer) = bp.peers.remove(&thread_id) {
+                            //println!("droping peer {}", peer.name);   
                         }
 
                         // exit the ivy thread if:
@@ -438,10 +434,9 @@ impl IvyBus {
     /// Handle new TCP connection:
     /// add new peer and spawn new peer thread
     fn handle_tcp_connection(
-            tcp_stream: TcpStream, addr: SocketAddr, snd_thd_terminated: &Sender<u32>,
+            tcp_stream: TcpStream, snd_thd_terminated: &Sender<u32>,
             bus_private: &Arc<RwLock<IvyPrivate>>,
             sen_peer: &Sender<(u32, IvyMsg)>) {
-        println!("TCP connection {tcp_stream:?} from {addr:?}");
         let mut bp = bus_private.write().unwrap();
         let peer_id = bp.next_thread_id.fetch_add(1);
         let stream = tcp_stream.try_clone().unwrap();
