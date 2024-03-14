@@ -109,3 +109,21 @@ impl From<&IvyMsg> for u8 {
         }
     }
 }
+
+
+/// Parse UDP annoucement message
+/// 
+/// Returns a tuple `(protocol_version: u8, port: u16, watcher_id: String, peer_name: String)`
+///
+pub fn parse_udp_announce(annouce: &str) -> Result<(u32, u16, String, String), IvyError> {
+    let splitted: Vec<_> = annouce.split(" ").collect();
+    if splitted.len() != 4 {
+        return Err(IvyError::ParseAnnounceError);
+    }
+    let protocol_version = splitted[0].parse()?;
+    let port = splitted[1].parse()?;
+    let watcher_id = splitted[2]; 
+    let peer_name = splitted[3]; 
+
+    Ok((protocol_version, port, watcher_id.to_owned(), peer_name.to_owned()))
+}

@@ -6,6 +6,7 @@ use core::fmt;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream} ; use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 // , UdpSocket
@@ -13,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use crossbeam::select;
-use ivy_messages::IvyMsg;
+use ivy_messages::{IvyMsg, parse_udp_announce};
 use regex::Regex;
 //use std::time::Duration;
 use socket2::{Socket, Domain, Type, Protocol};
@@ -154,13 +155,7 @@ impl IvyBus {
     }
 
     pub fn start_ivy_loop(&mut self, domain: &str) -> Result<(), IvyError> {
-        // create UDP socket
-        let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        let address: SocketAddr = domain.parse().unwrap();
-        udp_socket.set_reuse_address(true)?;
-        udp_socket.set_broadcast(true)?;
-        udp_socket.set_nonblocking(true)?;
-        udp_socket.bind(&address.into())?;
+
 
 
         // create TCPListener and bind it 
@@ -178,7 +173,8 @@ impl IvyBus {
         // TCP Listener
         let tcp_term_flag = self.private.read().unwrap().should_terminate.clone();
         let tcp_snd_term = snd_thd_terminated.clone();
-        let tcplistener_handle =
+        // TODO do something with the join handle !
+        let _tcplistener_handle =
             thread::spawn(move ||
                 Self::tcp_listener(listener,
                     snd_tcp, 
@@ -189,6 +185,16 @@ impl IvyBus {
         //self.private.write().unwrap().join_handles.insert(TCPLISTENER_THD_ID, tcplistener_handle);
 
 
+
+        // create UDP socket
+        let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let address: SocketAddr = domain.parse().unwrap();
+        udp_socket.set_reuse_address(true)?;
+        udp_socket.set_broadcast(true)?;
+        //udp_socket.set_nonblocking(true)?;
+        let _ = udp_socket.set_read_timeout(Some(Duration::from_millis(10)));
+        udp_socket.bind(&address.into())?;
+
         // Send UDP annoucement
         let watcher_id = format!("{}_{}", self.appname, port);
         // <protocol version> <TCP port> <watcherId> <application name>
@@ -197,31 +203,9 @@ impl IvyBus {
 
         // channels for thread terminaisons
         let udp_snd_term = snd_thd_terminated.clone();
+        let udp_term_flag = self.private.read().unwrap().should_terminate.clone();
         // UDP Listener for new peers
-        let udplistener_handle = thread::spawn(move || {
-            loop
-            {
-                let mut _buf:[u8; 1024];
-                // TODO
-                // match udp_socket.recv_from(&mut buf) {
-                //     Ok((n, src)) => {
-                //         println!("UDP received {n} bytes from {src:?}");
-                //         let rcv_str = String::from_utf8(buf[0..n].to_owned()).unwrap();
-                //         if announce == rcv_str {
-                //             println!("received back sended annouce");
-                //         } else {
-                //             println!("UDP rcv: {rcv_str}");
-                //         }
-                //     },
-                //     Err(error) => {
-
-                //     },
-                // }
-                break;
-            }
-            let _ = udp_snd_term.send(UDPLISTENER_THD_ID);
-
-        });
+        let udplistener_handle = thread::spawn(move || Self::udp_listener(udp_socket, udp_snd_term, udp_term_flag, watcher_id));
         self.private.write().unwrap().join_handles.insert(UDPLISTENER_THD_ID, udplistener_handle);
 
         // main Ivy loop
@@ -241,6 +225,54 @@ impl IvyBus {
         Ok(())
     }
 
+
+
+
+    fn udp_listener(
+            udp_socket: Socket,
+            udp_snd_term: Sender<u32>,
+            term: Arc<AtomicBool>,
+            my_watcher_id: String) {
+        let mut _buf = [MaybeUninit::uninit();1024];
+        
+        loop
+        {
+            if let Ok((n, src)) = udp_socket.recv_from(&mut _buf) {
+                println!("UDP received {n} bytes from {src:?}");
+
+                // DANGER! Do not read the buffer past the nth element !
+                // Assume all array is initialized: this is false!
+                // See socket2 recv method : promise it's fine for the [0..n] slice
+                let udp_frame = unsafe { std::mem::transmute::<_, &[u8]>(_buf.as_slice()) };
+                let udp_frame = udp_frame[0..n].to_owned();
+                let rcv_str = String::from_utf8(udp_frame).unwrap();
+                let parsed = parse_udp_announce(&rcv_str);
+                if let Ok(ret)  = parsed {
+                    let (protocol_version, port, watcher_id, peer_name) = ret;
+                    if protocol_version != PROTOCOL_VERSION {
+                        continue;
+                    }
+                    if watcher_id == my_watcher_id {
+                        // my own announce, ignoring it
+                        continue;
+                    }
+                    
+                    println!("announce: {watcher_id} / {my_watcher_id}");
+                    // TODO send (port, peer_name) to ivy thread
+                    (port, peer_name);
+                } else {
+                    
+                    println!("{parsed:?}");
+                }
+            }
+
+            if term.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        let _ = udp_snd_term.send(UDPLISTENER_THD_ID);
+    }
+
     fn ivy_loop(bus_private: Arc<RwLock<IvyPrivate>>, rcv_tcp: Receiver<(TcpStream, SocketAddr)>, rcv_cmd: Receiver<Command>,
     snd_thd_terminated: Sender<u32>, rcv_thd_terminated: Receiver<u32>) {
 
@@ -248,21 +280,25 @@ impl IvyBus {
 
         loop {
             select! {
+                // new TCP connection
                 recv(rcv_tcp) -> msg => {
                     if let Ok((tcp_stream, addr)) = msg {
                         Self::handle_tcp_connection(tcp_stream, addr, &snd_thd_terminated, &bus_private, &sen_peer);
                     }
                 },
+                // message from peer
                 recv(rcv_peer) -> msg => {
                     if let Ok((peer_id, msg)) = msg {
                         Self::handle_ivymsg(peer_id, &msg, &bus_private);
                     }
                 },
+                // command from application
                 recv(rcv_cmd) -> cmd => {
                     if let Ok(cmd) = cmd {
                         Self::handle_command(cmd, &bus_private);
                     }
                 },
+                // notification thread termination
                 recv(rcv_thd_terminated) -> msg => {
                     if let Ok(thread_id) = msg {
                         let mut bp = bus_private.write().unwrap();

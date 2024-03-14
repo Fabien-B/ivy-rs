@@ -6,6 +6,7 @@ pub enum IvyError {
     BadDomain,
     IoError(io::Error),
     ParseError(ParseIntError),
+    ParseAnnounceError,
     ParseFail,
 }
 
