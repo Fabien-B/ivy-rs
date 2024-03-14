@@ -15,12 +15,12 @@ fn main() {
 
 
     bus.send("hello you");
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_secs(10));
 
     bus.stop();
     println!("stopped!");
 
-    std::thread::sleep(Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(1));
     // bus.stop().await;
 
     // println!("start ended");

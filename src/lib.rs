@@ -56,10 +56,10 @@ impl Peer {
 
 struct PeerData {
     socket: TcpStream,
-    s: Sender<(u32, IvyMsg)>,
+    snd_ivymsg: Sender<(u32, IvyMsg)>,
     peer_id: u32,
     term: Arc<AtomicBool>,
-    s_pd: Sender<u32>,
+    snd_thd_terminated: Sender<u32>,
 }
 
 struct IvyPrivate {
@@ -246,37 +246,11 @@ impl IvyBus {
 
         let (sen_peer, rcv_peer) = unbounded::<(u32, IvyMsg)>();
 
-        // let mut bp = bus_private.write().unwrap();
-
         loop {
             select! {
                 recv(rcv_tcp) -> msg => {
-                    match msg {
-                        Ok((tcp_stream, addr)) =>  {
-                            println!("TCP connection {tcp_stream:?} from {addr:?}");
-                            let mut bp = bus_private.write().unwrap();
-                            let peer_id = bp.next_thread_id.fetch_add(1);
-                            let stream = tcp_stream.try_clone().unwrap();
-                            let peer = Peer::new(stream);
-
-                            let pd = PeerData{
-                                socket: tcp_stream,
-                                s: sen_peer.clone(),
-                                peer_id,
-                                term: peer.should_terminate.clone(),
-                                s_pd: snd_thd_terminated.clone(),
-                            };
-
-                            let handle = thread::spawn(move || Self::tcp_read(pd));
-                            bp.join_handles.insert(peer_id, handle);
-                            bp.peers.insert(peer_id, peer);
-
-                            if let Some(connected_cb) = &bp.client_connected_cb {
-                                connected_cb();
-                            }
-                            
-                        },
-                        Err(_error) => todo!(),
+                    if let Ok((tcp_stream, addr)) = msg {
+                        Self::handle_tcp_connection(tcp_stream, addr, &snd_thd_terminated, &bus_private, &sen_peer);
                     }
                 },
                 recv(rcv_peer) -> msg => {
@@ -316,6 +290,39 @@ impl IvyBus {
         }
     }
 
+    /// Handle new TCP connection:
+    /// add new peer and spawn new peer thread
+    fn handle_tcp_connection(
+            tcp_stream: TcpStream, addr: SocketAddr, snd_thd_terminated: &Sender<u32>,
+            bus_private: &Arc<RwLock<IvyPrivate>>,
+            sen_peer: &Sender<(u32, IvyMsg)>) {
+        println!("TCP connection {tcp_stream:?} from {addr:?}");
+        let mut bp = bus_private.write().unwrap();
+        let peer_id = bp.next_thread_id.fetch_add(1);
+        let stream = tcp_stream.try_clone().unwrap();
+        let peer = Peer::new(stream);
+
+        let pd = PeerData{
+            socket: tcp_stream,
+            snd_ivymsg: sen_peer.clone(),
+            peer_id,
+            term: peer.should_terminate.clone(),
+            snd_thd_terminated: snd_thd_terminated.clone(),
+        };
+
+        let handle = thread::spawn(move || Self::tcp_read(pd));
+        bp.join_handles.insert(peer_id, handle);
+        bp.peers.insert(peer_id, peer);
+
+        if let Some(connected_cb) = &bp.client_connected_cb {
+            connected_cb();
+        }
+        
+    }
+
+    /// Handle messages coming from a peer socket
+    /// 
+    /// See the details of the messages here: https://ivybus.gitlab.io/protocol_messages.html#messages
     fn handle_ivymsg(peer_id: u32, msg: &IvyMsg, bus_private: &Arc<RwLock<IvyPrivate>>) {
         match msg {
             IvyMsg::Bye => {
@@ -366,6 +373,9 @@ impl IvyBus {
         }
     }
 
+    /// Handle commands coming from the application
+    /// 
+    /// The application interact with the Ivy thread with Commands
     fn handle_command(cmd: Command, bus_private: &Arc<RwLock<IvyPrivate>>) {
         match cmd {
             Command::Sub(sub_id, regex) => {
@@ -432,6 +442,11 @@ impl IvyBus {
         }
     }
 
+    /// Listen for incoming TCP connections
+    /// 
+    /// Report new connections to Ivy thread via the `sen_tcp` channel
+    /// 
+    /// Report terminaison via the `snd_thd_terminated` channel
     fn tcp_listener(listener: TcpListener, sen_tcp: Sender<(TcpStream, SocketAddr)>, term: Arc<AtomicBool>,
                     snd_thd_terminated: Sender<u32>) {
         
@@ -443,7 +458,6 @@ impl IvyBus {
                         println!("Exiting TCPListener thread...");
                         break;
                     }
-                    //println!("TCP connection {tcp_stream:?} from {addr:?}");
                     let _ = sen_tcp.send((tcp_stream, addr));
                 },
                 Err(_error) => {
@@ -456,6 +470,11 @@ impl IvyBus {
 
     }
 
+    /// Receive and parse messages coming from a Peer.
+    /// 
+    /// Report received message to Ivy thread via the `data.snd_ivymsg` channel
+    /// 
+    /// Report terminaison via the `data.snd_thd_terminated` channel
     fn tcp_read(mut data: PeerData) {
         let mut buf = vec![0; 1024];
         let _ = data.socket.set_read_timeout(Some(Duration::from_millis(10)));
@@ -468,7 +487,7 @@ impl IvyBus {
                     for line in lines {
                         let msg = IvyMsg::parse(line);
                         if let Ok(msg) = msg {
-                            let _ = data.s.send((data.peer_id, msg));
+                            let _ = data.snd_ivymsg.send((data.peer_id, msg));
                         }
                     }
                 },
@@ -478,8 +497,8 @@ impl IvyBus {
                 break;
             }
         }
-        let _ = data.s_pd.send(data.peer_id);
-        println!("Exit thread peer {}", data.peer_id);
+        let _ = data.snd_thd_terminated.send(data.peer_id);
+        //println!("Exit thread peer {}", data.peer_id);
     }
 
 }
@@ -503,7 +522,6 @@ impl fmt::Debug for IvyPrivate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IvyPrivate")
         .field("peers", &self.peers)
-        //.field("peers_nb", &self.peers_nb)
         .finish()
     }
 }
