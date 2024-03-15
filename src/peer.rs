@@ -1,103 +1,82 @@
+use std::collections::HashMap;
+use std::io::Read;
+use std::net::TcpStream;
+use std::sync::atomic::Ordering;
+use std::sync::{atomic::AtomicBool, Arc, RwLock};
+use std::time::Duration;
+use crossbeam::channel::Sender;
 
-// use std::{net::TcpStream, io::{Error, Read, Write}, sync::{Arc, Mutex}};
-// use std::sync::mpsc;
-// use std::time::Duration;
-// use crate::ivy_messages::IvyMsg;
+use crate::ivy_messages::IvyMsg;
+
+#[derive(Debug)]
+pub struct Peer {
+    pub name: String,
+    pub subscriptions: HashMap<u32, String>,
+    pub stream: RwLock<TcpStream>,
+    pub should_terminate: Arc<AtomicBool>,
+}
+
+impl Peer {
+    pub fn new(stream: TcpStream) -> Self {
+        Peer {
+            name: String::new(),
+            subscriptions: HashMap::new(),
+            stream: RwLock::new(stream),
+            should_terminate: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn get_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+pub struct PeerData {
+    pub socket: TcpStream,
+    pub snd_ivymsg: Sender<(u32, IvyMsg)>,
+    pub peer_id: u32,
+    pub term: Arc<AtomicBool>,
+    pub snd_thd_terminated: Sender<u32>,
+}
 
 
-// #[derive(Debug)]
-// pub enum Command {
-//     Sub(u32, String),
-//     Msg(String),
-//     DirectMsg(String),
-//     Quit,
-//     Stop,
-// }
+/// Receive and parse messages coming from a Peer.
+/// 
+/// Report received message to Ivy thread via the `data.snd_ivymsg` channel
+/// 
+/// Report terminaison via the `data.snd_thd_terminated` channel
+pub fn tcp_read(mut data: PeerData) {
+    let mut buf = vec![0; 1024];
+    let _ = data.socket.set_read_timeout(Some(Duration::from_millis(10)));
+    loop {
+        match data.socket.read(&mut buf) {
+            Ok(n) => {
+                // socket closed
+                if n == 0 { break; }
 
-// pub struct Peer {
-//     joinHandle: std::thread::JoinHandle<()>,
-//     ch_cmd: mpsc::Sender<Command>,
-//     ch_msg: mpsc::Receiver<Command>,
-//     subscriptions: Arc<Mutex<Vec<(u32, String)>>>
-//     //stream: TcpStream,
-// }
+                let lines = buf[0..n]
+                .split(|c| *c==b'\n')
+                .filter(|buf| buf.len() > 0);
+                for line in lines {
+                    if let Ok(msg) = IvyMsg::parse(line) {
+                        let _ = data.snd_ivymsg.send((data.peer_id, msg));
+                    }
+                }
+            },
+            Err(e) => {
+                match e.kind() {
+                    std::io::ErrorKind::WouldBlock => {},
+                    _ => {
+                        println!("tcp error: {}", e.kind());
+                        break;
+                    },
+                }
+            },
+        }
 
-// impl Peer {
-//     pub fn handle_incoming(stream: TcpStream) -> Self {
-//         // cmd: from other threads to this one
-//         let (tx_cmd, rx_cmd) = mpsc::channel::<Command>();
-//         // msg: from this thread to main thread
-//         let (tx_msg, rx_msg) = mpsc::channel::<Command>();
-
-
-        
-//         let mut stream = stream;
-//         println!("ok: {stream:?}");
-//         stream.set_read_timeout(Duration::from_millis(500).into()).unwrap();
-//         let subscriptions = Arc::new(Mutex::new(Vec::new()));
-
-//         let subs = subscriptions.clone();
-        
-        
-//         let th = std::thread::spawn(move || {
-//             let mut buf = [0; 100];
-//             loop {
-//                 if let Ok(n) = stream.read(&mut buf) {
-//                     buf[0..n].split(|c| *c == '\n' as u8)
-//                     .filter(|b| b.len() != 0)
-//                     .for_each(|b| {
-//                         if let Ok(ivy_msg) = IvyMsg::parse(b) {
-//                             println!("{ivy_msg:?}");
-//                             match ivy_msg {
-//                                 IvyMsg::Bye => todo!(),
-//                                 IvyMsg::Sub(sub_id, reg) => subs.lock().unwrap().push((sub_id, reg)),
-//                                 IvyMsg::TextMsg(_, _) => todo!(),
-//                                 IvyMsg::Error(_) => todo!(),
-//                                 IvyMsg::DelSub(sub_id) => {
-//                                     subs.lock().unwrap().retain(|(id, _)| *id == sub_id);
-//                                 },
-//                                 IvyMsg::EndSub => todo!(),
-//                                 IvyMsg::PeerId(port, app_name) => (),
-//                                 IvyMsg::DirectMsg(_, _) => todo!(),
-//                                 IvyMsg::Quit => todo!(),
-//                                 IvyMsg::Ping(ping_id) => Peer::send(&mut stream, IvyMsg::Pong(ping_id)),
-//                                 IvyMsg::Pong(ping_id) => todo!(),
-//                             }
-//                         }
-//                     });
-
-//                 }
-//                 if let Ok(cmd) = rx_cmd.try_recv() {
-//                     println!("cmd: {:?}", cmd);
-//                         Peer::send(&mut stream, IvyMsg::EndSub);
-//                 }
-//             }
-//         });
-
-//         Self {
-//             joinHandle: th,
-//             ch_cmd: tx_cmd,
-//             ch_msg: rx_msg,
-//             subscriptions
-//         }
-//     }
-
-//     fn send(stream: &mut TcpStream, ivymsg: IvyMsg) {
-//         let buf = ivymsg.to_ascii();
-//         let b = buf.as_slice();
-//         stream.write(b);
-//     }
-
-//     pub fn send_message(&self, msg: &str) {
-//         println!("{}", msg);
-//         let cmd = Command::Msg(msg.into());
-//         let _ = self.ch_cmd.send(cmd);
-//     }
-
-//     pub fn send_direct_message(&self, msg: &str) {
-//         println!("{}", msg);
-//         let cmd = Command::DirectMsg(msg.into());
-//         let _ = self.ch_cmd.send(cmd);
-//     }
-
-// }
+        if data.term.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    let _ = data.snd_thd_terminated.send(data.peer_id);
+}

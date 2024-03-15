@@ -1,62 +1,32 @@
 pub mod ivyerror;
 // mod peer;
 mod ivy_messages;
+mod peer;
 
 use core::fmt;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::io::{Read, Write};
 use std::mem::MaybeUninit;
-use std::net::{SocketAddr, TcpListener, TcpStream} ; use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use crossbeam::select;
-use ivy_messages::{IvyMsg, parse_udp_announce};
 use regex::Regex;
 use socket2::{Domain, Protocol, Socket, Type};
-use ivyerror::IvyError;
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use crossbeam::atomic::AtomicCell;
 
-
+use ivy_messages::{IvyMsg, parse_udp_announce};
+use ivyerror::IvyError;
+use peer::{Peer, PeerData, tcp_read};
 
 const PROTOCOL_VERSION: u32 = 3;
 
 const TCPLISTENER_THD_ID: u32 = 0;
 const UDPLISTENER_THD_ID: u32 = 1;
-
-#[derive(Debug)]
-pub struct Peer {
-    name: String,
-    subscriptions: HashMap<u32, String>,
-    stream: RwLock<TcpStream>,
-    should_terminate: Arc<AtomicBool>,
-}
-
-impl Peer {
-    fn new(stream: TcpStream) -> Self {
-        Peer {
-            name: String::new(),
-            subscriptions: HashMap::new(),
-            stream: RwLock::new(stream),
-            should_terminate: Arc::new(AtomicBool::new(false)),
-            //join_handle: None
-        }
-    }
-
-    pub fn get_name(&self) -> String {
-        self.name.clone()
-    }
-}
-
-struct PeerData {
-    socket: TcpStream,
-    snd_ivymsg: Sender<(u32, IvyMsg)>,
-    peer_id: u32,
-    term: Arc<AtomicBool>,
-    snd_thd_terminated: Sender<u32>,
-}
 
 type IvyCb = Box<dyn Fn(&Peer, Vec<String>) + Send + Sync>;
 type IvyPeerConnectedCb = Box<dyn Fn(&Peer) + Send + Sync>;
@@ -392,7 +362,7 @@ impl IvyBus {
                                 snd_thd_terminated: snd_thd_terminated.clone(),
                             };
 
-                            let handle = thread::spawn(move || Self::tcp_read(pd));
+                            let handle = thread::spawn(move || tcp_read(pd));
                             bp.join_handles.insert(peer_id, handle);
                             bp.peers.insert(peer_id, peer);
                             
@@ -451,7 +421,7 @@ impl IvyBus {
             snd_thd_terminated: snd_thd_terminated.clone(),
         };
 
-        let handle = thread::spawn(move || Self::tcp_read(pd));
+        let handle = thread::spawn(move || tcp_read(pd));
         bp.join_handles.insert(peer_id, handle);
 
         bp.peers.insert(peer_id, peer);
@@ -630,46 +600,7 @@ impl IvyBus {
         let _ = snd_thd_terminated.send(TCPLISTENER_THD_ID);
     }
 
-    /// Receive and parse messages coming from a Peer.
-    /// 
-    /// Report received message to Ivy thread via the `data.snd_ivymsg` channel
-    /// 
-    /// Report terminaison via the `data.snd_thd_terminated` channel
-    fn tcp_read(mut data: PeerData) {
-        let mut buf = vec![0; 1024];
-        let _ = data.socket.set_read_timeout(Some(Duration::from_millis(10)));
-        loop {
-            match data.socket.read(&mut buf) {
-                Ok(n) => {
-                    // socket closed
-                    if n == 0 { break; }
-
-                    let lines = buf[0..n]
-                    .split(|c| *c==b'\n')
-                    .filter(|buf| buf.len() > 0);
-                    for line in lines {
-                        if let Ok(msg) = IvyMsg::parse(line) {
-                            let _ = data.snd_ivymsg.send((data.peer_id, msg));
-                        }
-                    }
-                },
-                Err(e) => {
-                    match e.kind() {
-                        std::io::ErrorKind::WouldBlock => {},
-                        _ => {
-                            println!("tcp error: {}", e.kind());
-                            break;
-                        },
-                    }
-                },
-            }
-
-            if data.term.load(Ordering::Acquire) {
-                break;
-            }
-        }
-        let _ = data.snd_thd_terminated.send(data.peer_id);
-    }
+    
 
 }
 
