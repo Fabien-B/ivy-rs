@@ -11,15 +11,17 @@ use crate::ivy_messages::IvyMsg;
 #[derive(Debug)]
 pub struct Peer {
     pub name: String,
+    pub id: u32,
     pub subscriptions: HashMap<u32, String>,
     pub stream: RwLock<TcpStream>,
     pub should_terminate: Arc<AtomicBool>,
 }
 
 impl Peer {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, id: u32) -> Self {
         Peer {
             name: String::new(),
+            id,
             subscriptions: HashMap::new(),
             stream: RwLock::new(stream),
             should_terminate: Arc::new(AtomicBool::new(false)),
@@ -28,6 +30,10 @@ impl Peer {
 
     pub fn get_name(&self) -> String {
         self.name.clone()
+    }
+
+    pub fn get_id(&self) -> u32 {
+        self.id
     }
 }
 

@@ -1,6 +1,6 @@
 pub mod ivyerror;
 mod ivy_messages;
-mod peer;
+pub mod peer;
 
 use core::fmt;
 use std::collections::HashMap;
