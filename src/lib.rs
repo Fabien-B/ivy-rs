@@ -378,13 +378,16 @@ impl IvyBus {
                 // notification thread termination
                 recv(rcv_thd_terminated) -> msg => {
                     if let Ok(thread_id) = msg {
-                        Self::handle_terminated(thread_id, &bus_private);
+                        if Self::handle_terminated(thread_id, &bus_private) {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
+    #[must_use]
     fn handle_terminated(thread_id: u32, bus_private: &Arc<RwLock<IvyPrivate>>) -> bool {
         let mut bp = bus_private.write().unwrap();
         // join the thread
