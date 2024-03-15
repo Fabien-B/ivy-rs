@@ -22,6 +22,9 @@ fn main() {
     //std::thread::sleep(Duration::from_secs(1));
 
 
+    let p = bus.ping(2, Duration::from_millis(500));
+    println!("ping: {p:?}");
+
     for _ in 0..40 {
         bus.send("hello you");
         std::thread::sleep(Duration::from_secs(2));

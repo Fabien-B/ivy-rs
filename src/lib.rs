@@ -1,18 +1,17 @@
 pub mod ivyerror;
-// mod peer;
 mod ivy_messages;
 mod peer;
 
 use core::fmt;
 use std::collections::HashMap;
 use std::convert::identity;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crossbeam::select;
 use regex::Regex;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -44,7 +43,8 @@ struct IvyPrivate {
     should_terminate: Arc<AtomicBool>,
     local_port: u16,
     ivy_thd_handle: Option<JoinHandle<()>>,
-    join_handles: HashMap<u32, JoinHandle<()>>
+    join_handles: HashMap<u32, JoinHandle<()>>,
+    ping_data: HashMap<u32, (Sender<Duration>, Instant)>,
 }
 
 impl IvyPrivate {
@@ -60,7 +60,8 @@ impl IvyPrivate {
             should_terminate: Arc::new(AtomicBool::new(false)),
             local_port: 0,
             ivy_thd_handle: None,
-            join_handles: HashMap::new()
+            join_handles: HashMap::new(),
+            ping_data: HashMap::new()
         }
     }
 }
@@ -69,10 +70,11 @@ pub struct IvyBus {
     private: Arc<RwLock<IvyPrivate>>,
     snd: Option<Sender<Command>>,
     next_sub_id: AtomicCell<u32>,
+    next_ping_id: AtomicCell<u32>,
 }
 
 /// Commands from application to Ivy thread
-pub enum Command {
+enum Command {
     /// Subscribe to a regex
     Sub(u32, String),
     /// Send message to peers (matching)
@@ -83,7 +85,8 @@ pub enum Command {
     /// Unsubscribe from a regex
     UnSub(u32),
     /// Ping peer
-    Ping(u32),
+    /// peer_id, ping_id, channel(time)
+    Ping(u32, u32, Sender<Duration>),
     /// Stop Ivy
     Stop,
 }
@@ -94,7 +97,8 @@ impl IvyBus {
         IvyBus {
             private: Arc::new(RwLock::new(IvyPrivate::new(appname.into()))),
             snd: None,
-            next_sub_id: AtomicCell::new(0)
+            next_sub_id: AtomicCell::new(0),
+            next_ping_id: AtomicCell::new(0),
         }
     }
 
@@ -144,6 +148,20 @@ impl IvyBus {
         if let Some(snd) = &self.snd {
             let cmd = Command::UnSub(sub_id);
             let _ = snd.send(cmd);
+        }
+    }
+
+    pub fn ping(&self, peer_id: u32, timeout: Duration) -> Result<Duration, IvyError> {
+        if let Some(snd) = &self.snd {
+            let (ping_snd, ping_rcv) = unbounded::<Duration>();
+            let ping_id = self.next_ping_id.fetch_add(1);
+            let _ = snd.send(Command::Ping(peer_id, ping_id, ping_snd));
+            match ping_rcv.recv_timeout(timeout) {
+                Ok(d) => Ok(d),
+                Err(_) => Err(IvyError::PingTimeout),
+            }
+        } else {
+            Err(IvyError::BadInit)
         }
     }
 
@@ -236,6 +254,12 @@ impl IvyBus {
         Ok(())
     }
 
+
+//////////////////////////////////////////////////
+/// Private methods
+//////////////////////////////////////////////////
+
+
     fn make_udp_socket(domain: &str) -> Result<(Socket, SocketAddr), IvyError> {
         let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         let address: SocketAddr = domain.parse().unwrap();
@@ -291,11 +315,6 @@ impl IvyBus {
                         let addr = SocketAddr::new(ip, port);
                         let _ = snd_udp.send((addr, peer_name));
                     }
-                    
-                    
-                } else {
-                    
-                    println!("{parsed:?}");
                 }
             }
 
@@ -342,62 +361,41 @@ impl IvyBus {
                         Self::handle_command(cmd, &bus_private);
                     }
                 },
+                // new UDP message (new peer incoming)
                 recv(rcv_udp) -> udp_msg => {
                     if let Ok((addr, peer_name)) = udp_msg {
-                        let ss = TcpStream::connect(addr);
-                        if let Ok(mut stream) = ss {
-                            let stream_tcp_read = stream.try_clone().unwrap();
-                            let stream_peer = stream.try_clone().unwrap();
-                            let mut bp = bus_private.write().unwrap();
-
-                            let mut peer = Peer::new(stream_peer);
-                            peer.name = peer_name;
-                            let peer_id = bp.next_thread_id.fetch_add(1);
-
-                            let pd = PeerData {
-                                socket: stream_tcp_read,
-                                snd_ivymsg: sen_peer.clone(),
-                                peer_id,
-                                term: peer.should_terminate.clone(),
-                                snd_thd_terminated: snd_thd_terminated.clone(),
-                            };
-
-                            let handle = thread::spawn(move || tcp_read(pd));
-                            bp.join_handles.insert(peer_id, handle);
-                            bp.peers.insert(peer_id, peer);
-                            
-                            let msg = IvyMsg::PeerId(bp.local_port, bp.appname.clone());
-                            let buf = msg.to_ascii();
-                            let _ = stream.write(&buf);
-                            Self::send_initial_subscriptions(&mut stream, &bp.subscriptions);
-                        }
+                        Self::handle_udp(&bus_private, addr, peer_name, &sen_peer, &snd_thd_terminated);
                     }
                 }
                 // notification thread termination
                 recv(rcv_thd_terminated) -> msg => {
                     if let Ok(thread_id) = msg {
-                        let mut bp = bus_private.write().unwrap();
-                        // join the thread
-                        if let Some(handle) = bp.join_handles.remove(&thread_id) {
-                            let _ = handle.join();
-                        }
-
-                        // remove the associated peer (if it's a peer thread)
-                        if let Some(_peer) = bp.peers.remove(&thread_id) {
-                            //println!("droping peer {}", peer.name);   
-                        }
-
-                        // exit the ivy thread if:
-                        //  - all threads have been joined,
-                        //  - the terminate flag is set
-                        if bp.join_handles.is_empty() && bp.should_terminate.load(Ordering::Acquire){
-                            break;
-                        }
-                        
+                        Self::handle_terminated(thread_id, &bus_private);
                     }
                 }
-
             }
+        }
+    }
+
+    fn handle_terminated(thread_id: u32, bus_private: &Arc<RwLock<IvyPrivate>>) -> bool {
+        let mut bp = bus_private.write().unwrap();
+        // join the thread
+        if let Some(handle) = bp.join_handles.remove(&thread_id) {
+            let _ = handle.join();
+        }
+
+        // remove the associated peer (if it's a peer thread)
+        if let Some(_peer) = bp.peers.remove(&thread_id) {
+            //println!("droping peer {}", peer.name);   
+        }
+
+        // exit the ivy thread if:
+        //  - all threads have been joined,
+        //  - the terminate flag is set
+        if bp.join_handles.is_empty() && bp.should_terminate.load(Ordering::Acquire){
+            true
+        } else {
+            false
         }
     }
 
@@ -508,24 +506,28 @@ impl IvyBus {
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
             },
-            IvyMsg::Pong(_pong_id) => todo!(),
+            IvyMsg::Pong(_pong_id) => {
+                let mut bp = bus_private.write().unwrap();
+                if let Some((snd, start_time)) = bp.ping_data.remove(&peer_id) {
+                    let _ = snd.send(start_time.elapsed());
+                }
+            },
         }
     }
 
     /// Handle commands coming from the application
     /// 
-    /// The application interact with the Ivy thread with Commands
+    /// The application interact with the Ivy thread with [Command]
     fn handle_command(cmd: Command, bus_private: &Arc<RwLock<IvyPrivate>>) {
+        let mut bp = bus_private.write().unwrap();
         match cmd {
             Command::Sub(sub_id, regex) => {
-                let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     let msg = IvyMsg::Sub(sub_id, regex.clone());
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
             },
             Command::SendMsg(message) => {
-                let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     peer.subscriptions.iter().for_each(|(sub_id, regex)| {
                         // TODO do not recreate the regex each time
@@ -543,25 +545,28 @@ impl IvyBus {
                 }
             },
             Command::SendDirectMsg(peer_id, id, msg) => {
-                let bp = bus_private.write().unwrap();
                 if let Some(peer) = bp.peers.get(&peer_id) {
                     let msg = IvyMsg::DirectMsg(id, msg);
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
             },
             Command::UnSub(sub_id) => {
-                let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     let msg = IvyMsg::DelSub(sub_id);
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
             },
-            Command::Ping(_peer_id) => {
-                todo!()
+            Command::Ping(peer_id, ping_id, snd) => {
+                if bp.peers.contains_key(&peer_id) {
+                    bp.ping_data.insert(peer_id, (snd, Instant::now()));
+                    if let Some(peer) = bp.peers.get(&peer_id) {
+                        let msg = IvyMsg::Ping(ping_id);
+                        let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
+                    }
+                }
             },
             Command::Stop => {
                 // say Bye to all threads
-                let bp = bus_private.write().unwrap();
                 for peer in bp.peers.values() {
                     let buf = IvyMsg::Bye.to_ascii();
                     let _ = peer.stream.write().unwrap().write(&buf);
@@ -580,11 +585,9 @@ impl IvyBus {
         }
     }
 
-    /// Listen for incoming TCP connections
-    /// 
-    /// Report new connections to Ivy thread via the `sen_tcp` channel
-    /// 
-    /// Report terminaison via the `snd_thd_terminated` channel
+    /// Listen for incoming TCP connections:
+    /// - Report new connections to Ivy thread via the `sen_tcp` channel
+    /// - Report terminaison via the `snd_thd_terminated` channel
     fn tcp_listener(listener: TcpListener, sen_tcp: Sender<(TcpStream, SocketAddr)>, term: Arc<AtomicBool>,
                     snd_thd_terminated: Sender<u32>) {
         loop
@@ -597,11 +600,39 @@ impl IvyBus {
                 Err(_error) => {},
             }
         }
+        // FIXME this never actually happen because listener.accept is blocking, without timeout...
         let _ = snd_thd_terminated.send(TCPLISTENER_THD_ID);
     }
 
-    
+    fn handle_udp(bus_private: &Arc<RwLock<IvyPrivate>>, addr: SocketAddr, peer_name: String,
+            sen_peer: &Sender<(u32, IvyMsg)>, snd_thd_terminated: &Sender<u32>) {
+        if let Ok(mut stream) = TcpStream::connect(addr) {
+            let stream_tcp_read = stream.try_clone().unwrap();
+            let stream_peer = stream.try_clone().unwrap();
+            let mut bp = bus_private.write().unwrap();
 
+            let mut peer = Peer::new(stream_peer);
+            peer.name = peer_name;
+            let peer_id = bp.next_thread_id.fetch_add(1);
+
+            let pd = PeerData {
+                socket: stream_tcp_read,
+                snd_ivymsg: sen_peer.clone(),
+                peer_id,
+                term: peer.should_terminate.clone(),
+                snd_thd_terminated: snd_thd_terminated.clone(),
+            };
+
+            let handle = thread::spawn(move || tcp_read(pd));
+            bp.join_handles.insert(peer_id, handle);
+            bp.peers.insert(peer_id, peer);
+            
+            let msg = IvyMsg::PeerId(bp.local_port, bp.appname.clone());
+            let buf = msg.to_ascii();
+            let _ = stream.write(&buf);
+            Self::send_initial_subscriptions(&mut stream, &bp.subscriptions);
+        }
+    }
 }
 
 
