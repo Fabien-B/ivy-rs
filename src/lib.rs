@@ -76,7 +76,7 @@ pub struct IvyBus {
 /// Commands from application to Ivy thread
 enum Command {
     /// Subscribe to a regex
-    Sub(u32, String),
+    Sub(u32, String, IvyCb),
     /// Send message to peers (matching)
     SendMsg(String),
     /// Send a direct message to a peer (unique peer, no matching)
@@ -124,14 +124,15 @@ impl IvyBus {
     /// # Return value
     /// Returns a `sub_id: u32` that can be used to unsubscribe from that regex
     pub fn subscribe(&self, regex: &str, cb: IvyCb) -> u32 {
-        let mut bp = self.private.write().unwrap();
         let sub_id = self.next_sub_id.fetch_add(1);
-        bp.subscriptions.insert(sub_id, (regex.into(), cb));
-
         // if ivy loop is running, send a message
         if let Some(snd) = &self.snd {
-            let cmd = Command::Sub(sub_id, regex.into());
+            let cmd = Command::Sub(sub_id, regex.into(), cb);
             let _ = snd.send(cmd);
+        } else {
+            // ivy loop not running, add the subscription directly
+            let mut bp = self.private.write().unwrap();
+            bp.subscriptions.insert(sub_id, (regex.into(), cb));
         }
         // return subscription id
         sub_id
@@ -141,17 +142,24 @@ impl IvyBus {
     /// # Arguments
     /// `sub_id: u32`: regex identifier, as returned by the `subscribe` method
     pub fn unsubscribe(&self, sub_id: u32) {
-        let mut bp = self.private.write().unwrap();
-        bp.subscriptions.remove(&sub_id);
-
         // if ivy loop is running, send a message
         if let Some(snd) = &self.snd {
             let cmd = Command::UnSub(sub_id);
             let _ = snd.send(cmd);
+        } else {
+            // ivy loop not running, remove the subscription directly
+            let mut bp = self.private.write().unwrap();
+            bp.subscriptions.remove(&sub_id);
         }
     }
 
     pub fn ping(&self, peer_id: u32, timeout: Duration) -> Result<Duration, IvyError> {
+
+        match self.private.try_write() {
+            Ok(_) => (),
+            Err(_) => {return Err(IvyError::DeadLock);},
+        }
+
         if let Some(snd) = &self.snd {
             let (ping_snd, ping_rcv) = unbounded::<Duration>();
             let ping_id = self.next_ping_id.fetch_add(1);
@@ -409,7 +417,7 @@ impl IvyBus {
         let peer_id = bp.next_thread_id.fetch_add(1);
         let stream = tcp_stream.try_clone().unwrap();
         let mut stream_init_subs = tcp_stream.try_clone().unwrap();
-        let peer = Peer::new(stream);
+        let peer = Peer::new(stream, peer_id);
 
         let pd = PeerData {
             socket: tcp_stream,
@@ -521,11 +529,13 @@ impl IvyBus {
     fn handle_command(cmd: Command, bus_private: &Arc<RwLock<IvyPrivate>>) {
         let mut bp = bus_private.write().unwrap();
         match cmd {
-            Command::Sub(sub_id, regex) => {
+            Command::Sub(sub_id, regex, cb) => {
+                bp.subscriptions.insert(sub_id, (regex.clone(), cb));
                 for peer in bp.peers.values() {
                     let msg = IvyMsg::Sub(sub_id, regex.clone());
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
                 }
+                
             },
             Command::SendMsg(message) => {
                 for peer in bp.peers.values() {
@@ -551,6 +561,7 @@ impl IvyBus {
                 }
             },
             Command::UnSub(sub_id) => {
+                bp.subscriptions.remove(&sub_id);
                 for peer in bp.peers.values() {
                     let msg = IvyMsg::DelSub(sub_id);
                     let _ = peer.stream.write().unwrap().write(&msg.to_ascii());
@@ -610,10 +621,10 @@ impl IvyBus {
             let stream_tcp_read = stream.try_clone().unwrap();
             let stream_peer = stream.try_clone().unwrap();
             let mut bp = bus_private.write().unwrap();
-
-            let mut peer = Peer::new(stream_peer);
-            peer.name = peer_name;
             let peer_id = bp.next_thread_id.fetch_add(1);
+            let mut peer = Peer::new(stream_peer, peer_id);
+            peer.name = peer_name;
+            
 
             let pd = PeerData {
                 socket: stream_tcp_read,

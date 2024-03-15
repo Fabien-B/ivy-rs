@@ -9,6 +9,7 @@ pub enum IvyError {
     ParseAnnounceError,
     ParseFail,
     PingTimeout,
+    DeadLock,
 }
 
 
